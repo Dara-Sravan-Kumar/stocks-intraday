@@ -1,0 +1,8 @@
+# stocks-intraday dashboard — fixed port so it never collides with
+# stocks-short-term (8501) or mcx-short-term (8502).
+[server]
+port = 8503
+headless = true
+
+[browser]
+gatherUsageStats = false

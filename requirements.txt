@@ -1,0 +1,11 @@
+pandas>=2.0
+numpy>=1.26
+yfinance>=0.2.40
+dhanhq>=2.0
+fyers-apiv3>=3.1
+requests>=2.31
+python-dotenv>=1.0
+rich>=13.0
+streamlit>=1.30
+pytest>=8.0
+tzdata>=2024.1

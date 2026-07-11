@@ -1,0 +1,102 @@
+"""Backtest CLI.
+
+Examples:
+  python run_backtest.py --fetch --from 2026-06-15 --to 2026-07-08
+  python run_backtest.py --from 2026-06-15 --to 2026-07-08 --strategies orb,gap
+  python run_backtest.py --from 2026-06-15 --to 2026-07-08 --symbols RELIANCE,SBIN
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+from datetime import date, timedelta
+
+from rich.console import Console
+from rich.table import Table
+
+import config
+from bot import db, history, instruments
+from bot.backtest import max_drawdown_pct, run_backtest
+from bot.strategies import build_strategies
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Replay historical 1m bars through the engine")
+    ap.add_argument("--from", dest="start", default=None, help="YYYY-MM-DD")
+    ap.add_argument("--to", dest="end", default=None, help="YYYY-MM-DD (inclusive)")
+    ap.add_argument("--symbols", default=None, help="comma list; default = full universe")
+    ap.add_argument("--strategies", default=None, help="comma list; default = all enabled")
+    ap.add_argument("--fetch", action="store_true", help="backfill 1m history first")
+    ap.add_argument("--fetch-dhan", action="store_true", help="backfill via Dhan instead of yfinance")
+    ap.add_argument("--fetch-fyers", action="store_true",
+                    help="backfill via Fyers (free, months of 1m history)")
+    ap.add_argument("--interval", type=int, default=None, metavar="MIN",
+                    help="strategy bar interval in minutes (default: config, 5)")
+    ap.add_argument("--persist", action="store_true",
+                    help="write trades/equity to the DB (mode BACKTEST) so the "
+                         "dashboard's Runs tab can show this backtest")
+    args = ap.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    console = Console()
+    if args.interval:
+        config.STRATEGY_INTERVAL_MIN = args.interval
+
+    end = date.fromisoformat(args.end) if args.end else date.today() - timedelta(days=1)
+    start = date.fromisoformat(args.start) if args.start else end - timedelta(days=20)
+
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",")]
+    else:
+        symbols = sorted(instruments.load_instruments())
+    strat_names = [s.strip() for s in args.strategies.split(",")] if args.strategies else None
+    strategies = build_strategies(strat_names)
+    console.print(f"[bold]Universe:[/bold] {len(symbols)} symbols | "
+                  f"[bold]Strategies:[/bold] {', '.join(s.name for s in strategies)} | "
+                  f"[bold]{config.STRATEGY_INTERVAL_MIN}m bars[/bold] | {start} → {end}")
+
+    if args.fetch or args.fetch_dhan or args.fetch_fyers:
+        console.print("Backfilling 1m history…")
+        all_syms = symbols + list(config.INDEX_SYMBOLS)
+        if args.fetch_fyers:
+            n = history.fetch_1m_fyers(all_syms, start, end)
+        elif args.fetch_dhan:
+            instr = instruments.load_instruments()
+            ids = {s: (instr[s].dhan_security_id or "") for s in symbols if s in instr}
+            n = history.fetch_1m_dhan(ids, start, end)
+        else:
+            n = history.fetch_1m_yfinance(all_syms, start, end)
+        console.print(f"stored {n:,} bars; dates in cache: {', '.join(db.bar_dates()[-25:])}")
+
+    result = run_backtest(symbols, strategies, start, end, persist=args.persist)
+    if not result.sessions:
+        console.print("[red]No cached bars for that range — run with --fetch first.[/red]")
+        return
+
+    table = Table(title=f"Backtest {start} → {end} ({len(result.sessions)} sessions)")
+    for col in ("Strategy", "Trades", "Win%", "Gross ₹", "Costs ₹", "Net ₹", "Avg R", "PF"):
+        table.add_column(col, justify="right")
+    for name, sr in sorted(result.per_strategy.items()):
+        pf = result.profit_factor(name)
+        table.add_row(
+            name, str(sr.trades), f"{sr.win_rate:.0f}",
+            f"{sr.gross:,.0f}", f"{sr.costs:,.0f}", f"{sr.net:,.0f}",
+            f"{sr.avg_r:.2f}" if sr.avg_r is not None else "-",
+            f"{pf:.2f}" if pf not in (None, float('inf')) else ("∞" if pf else "-"),
+        )
+    console.print(table)
+
+    total_net = sum(result.daily_pnl.values())
+    final_eq = result.equity_curve[-1][1] if result.equity_curve else config.PAPER_STARTING_CASH
+    dd = max_drawdown_pct(result.equity_curve)
+    wins = sum(1 for v in result.daily_pnl.values() if v > 0)
+    console.print(
+        f"\n[bold]Total net:[/bold] ₹{total_net:,.0f}  "
+        f"[bold]Final equity:[/bold] ₹{final_eq:,.0f}  "
+        f"[bold]Max DD:[/bold] {dd:.1f}%  "
+        f"[bold]Green days:[/bold] {wins}/{len(result.sessions)}"
+    )
+
+
+if __name__ == "__main__":
+    main()
