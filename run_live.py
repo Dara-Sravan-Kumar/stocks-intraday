@@ -214,6 +214,16 @@ def main() -> None:
     reports.promotion_readiness(console)
     if not replay_mode:
         alerts.send(f"**{session_date}** session done\n```{summary}```")
+        # Tail of the run: discover + breed once/day (expensive; LLM + backtests).
+        # Fully guarded — a discovery failure must never affect the trading run.
+        try:
+            from bot.discovery.automation import run_daily_discovery
+            rep = run_daily_discovery()
+            if "skipped" not in rep:
+                console.print(f"[dim]Daily discovery: "
+                              f"{'; '.join(f'{c}={v}' for c, v in rep['channels'].items())}[/dim]")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("daily discovery failed: %s", exc)
 
 
 if __name__ == "__main__":
