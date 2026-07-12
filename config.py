@@ -436,3 +436,14 @@ BACKTEST_GATE = {
 # net-negative (the gate can be fooled; the live ledger can't).
 DISCOVERED_RETIRE_MIN_TRADES = 15
 DISCOVERED_RETIRE_MODES = ("PAPER", "PAPER-OPT", "BACKTEST")
+
+# LLM discoverer (Phase 3) — proposes published INTRADAY strategies via the
+# Claude CLI (subscription-billed `claude -p`, NOT the paid API).
+DISCOVERY_LLM_ENABLED = True
+CLAUDE_CLI = "claude"                  # resolved on PATH; overridable
+DISCOVERY_N_PER_RUN = 6                # strategies requested per discovery call
+DISCOVERY_TIMEOUT_SEC = 240
+# Genetic mixer (Phase 4)
+MIXER_ENABLED = True
+MIXER_OFFSPRING_PER_RUN = 6
+MIXER_RNG_SEED = 1729                  # deterministic breeding (tests + reproducibility)
