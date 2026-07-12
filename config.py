@@ -400,3 +400,39 @@ def discord_settings() -> dict:
         "bot_token": os.getenv("DISCORD_BOT_TOKEN", "").strip(),
         "channel_id": os.getenv("DISCORD_CHANNEL_ID", "").strip(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Self-improving discovered strategy fleet (bot/discovery/)
+#   Strategies represented as data (a boolean entry_expr), gated by an
+#   in-sample/out-of-sample backtest on cached 1m bars, run as extra variants
+#   in two DISCOVERED channels. INTRADAY-only; all paper.
+# ---------------------------------------------------------------------------
+DISCOVERY_ENABLED = True
+MAX_DISCOVERED_PICKS_PER_DAY = 20      # per-channel entry budget within a day
+DISCOVERED_FLEET_MAX = 40              # active specs per channel (bounds fleet size)
+DISCOVERED_EQ_MAX_SYMBOLS = 6          # stocks a gate replay samples (speed)
+DISCOVERED_ENTRY_DEADLINE = "13:30"    # no discovered entries after this (square-off room)
+
+# Intraday target/stop derivation reused by every discovered spec.
+DISCOVERED_EQ_STOP_PCT = 0.5           # equity: stop this % from entry
+DISCOVERED_OPT_PREMIUM_STOP_PCT = 35.0 # option: premium stop, like opt_orb
+
+# Backtest gate — the overfitting defense. The OUT-OF-SAMPLE window is the test.
+BACKTEST_GATE = {
+    "gate_sessions": 60,        # sessions of recent history the daily gate replays
+    "oos_fraction": 0.35,       # most-recent 35% of sessions = out-of-sample
+    "min_oos_trades": 8,        # OOS must produce at least this many trades
+    "min_win_rate": 45.0,       # percent, OOS
+    "min_profit_factor": 1.2,   # OOS
+    "eq_stop_pct": 0.5,         # equity replay stop distance (%)
+    "opt_stop_pct": 0.25,       # index-move stop for the OPT proxy (%)
+    "friction_pct": 0.12,       # equity round-trip drag charged per replay trade
+    "opt_friction_pct": 1.0,    # option round-trip is far heavier on premium
+    "hold_bars_max": 12,        # 5m bars max hold before a time-exit (intraday)
+    "entry_deadline": "13:30",  # replay stops taking entries after this
+}
+# A live spec is retired once it has a real forward-paper track record that is
+# net-negative (the gate can be fooled; the live ledger can't).
+DISCOVERED_RETIRE_MIN_TRADES = 15
+DISCOVERED_RETIRE_MODES = ("PAPER", "PAPER-OPT", "BACKTEST")

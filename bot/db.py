@@ -140,6 +140,27 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_trades_variant ON trades (variant_key, exit_ts);
     CREATE INDEX IF NOT EXISTS idx_positions_variant ON positions (variant_key, status);
     """,
+    # 003 — discovered strategy fleet: each row is a strategy-as-data spec that
+    # trades as a variant of its DISCOVERED channel. name == the variant_key its
+    # trades are recorded under, so a spec's ledger is a plain query on trades.
+    """
+    CREATE TABLE IF NOT EXISTS discovered_specs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        channel TEXT NOT NULL,
+        spec_json TEXT NOT NULL,
+        entry_expr TEXT NOT NULL,
+        canonical_expr TEXT NOT NULL,
+        source TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ACTIVE',
+        gate_json TEXT,
+        created_at TEXT NOT NULL,
+        retired_at TEXT,
+        retire_reason TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_specs_channel_status
+        ON discovered_specs (channel, status);
+    """,
 ]
 
 _local = threading.local()
@@ -393,3 +414,77 @@ def kv_set(key: str, value: str) -> None:
 def kv_delete(key: str) -> None:
     connect().execute("DELETE FROM kv WHERE key=?", (key,))
     connect().commit()
+
+
+# --- discovered specs -------------------------------------------------------
+
+def insert_discovered_spec(*, name: str, channel: str, spec_json: str,
+                           entry_expr: str, canonical_expr: str, source: str,
+                           gate_json: str, created_at: str) -> int:
+    cur = connect().execute(
+        "INSERT INTO discovered_specs (name, channel, spec_json, entry_expr, "
+        "canonical_expr, source, status, gate_json, created_at) "
+        "VALUES (?,?,?,?,?,?, 'ACTIVE', ?, ?)",
+        (name, channel, spec_json, entry_expr, canonical_expr, source,
+         gate_json, created_at),
+    )
+    connect().commit()
+    return int(cur.lastrowid)
+
+
+def discovered_specs(channel: str | None = None,
+                     status: str = "ACTIVE") -> list[sqlite3.Row]:
+    q = "SELECT * FROM discovered_specs WHERE 1=1"
+    params: list = []
+    if status:
+        q += " AND status=?"
+        params.append(status)
+    if channel:
+        q += " AND channel=?"
+        params.append(channel)
+    return list(connect().execute(q + " ORDER BY created_at", params))
+
+
+def count_discovered_specs(channel: str, status: str = "ACTIVE") -> int:
+    row = connect().execute(
+        "SELECT COUNT(*) AS n FROM discovered_specs WHERE channel=? AND status=?",
+        (channel, status),
+    ).fetchone()
+    return int(row["n"])
+
+
+def canonical_exprs(channel: str, status: str = "ACTIVE") -> set[str]:
+    return {r["canonical_expr"] for r in connect().execute(
+        "SELECT canonical_expr FROM discovered_specs WHERE channel=? AND status=?",
+        (channel, status),
+    )}
+
+
+def retire_discovered_spec(name: str, retired_at: str, reason: str) -> None:
+    connect().execute(
+        "UPDATE discovered_specs SET status='RETIRED', retired_at=?, retire_reason=? "
+        "WHERE name=?", (retired_at, reason, name),
+    )
+    connect().commit()
+
+
+def variant_stats(variant_key: str, mode: str | None = None) -> dict:
+    """Realized ledger for one variant: closed-trade count, wins, net P&L."""
+    q = ("SELECT COUNT(*) AS n, "
+         "COALESCE(SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END), 0) AS wins, "
+         "COALESCE(SUM(net_pnl), 0) AS net FROM trades WHERE variant_key=?")
+    params: list = [variant_key]
+    if mode:
+        q += " AND mode=?"
+        params.append(mode)
+    r = connect().execute(q, params).fetchone()
+    return {"trades": int(r["n"]), "wins": int(r["wins"]), "net": float(r["net"])}
+
+
+def bar_symbols(exclude: set[str] | None = None) -> list[str]:
+    """Distinct symbols present in bars_1m (for gate sampling)."""
+    rows = connect().execute("SELECT DISTINCT symbol FROM bars_1m ORDER BY symbol")
+    out = [r["symbol"] for r in rows]
+    if exclude:
+        out = [s for s in out if s not in exclude]
+    return out

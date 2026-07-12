@@ -125,4 +125,22 @@ def build_strategies(names: list[str] | None = None,
             continue
         if config.STRATEGY_PARAMS.get(name, {}).get("enabled", False):
             out.append(cls())
+
+    if names is None and getattr(config, "DISCOVERY_ENABLED", False):
+        out.extend(_build_discovered(options_mode))
     return out
+
+
+def _build_discovered(options_mode: bool) -> list[Strategy]:
+    """Load ACTIVE discovered specs into their channel's ExprStrategy. Fully
+    guarded — a discovery failure must never stop the classic fleet from loading."""
+    try:
+        from bot.discovery.registry import load_active_specs
+        from bot.strategies.discovered import DiscoveredEquity, DiscoveredOptions
+        cls = DiscoveredOptions if options_mode else DiscoveredEquity
+        specs = load_active_specs(cls.channel)
+        return [cls(specs)]
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).warning("discovered channel load failed", exc_info=True)
+        return []

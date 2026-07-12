@@ -144,7 +144,10 @@ def test_build_strategies_options_mode():
     eq = build_strategies()
     assert not any(s.requires_options for s in eq)
     opt = build_strategies(options_mode=True)
-    assert {s.name for s in opt} == {"opt_orb", "opt_trend_day", "opt_straddle"}
+    # the classic option strategies plus the always-present DISCOVERED_OPT channel
+    assert {s.name for s in opt} == {
+        "opt_orb", "opt_trend_day", "opt_straddle", "DISCOVERED_OPT",
+    }
 
 
 def test_straddle_emits_two_short_legs():

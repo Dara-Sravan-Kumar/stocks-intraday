@@ -32,9 +32,10 @@ def bar5(o, h, l, c, v=10_000, at=None):  # noqa: E741
 def test_build_strategies_registry():
     strats = build_strategies()
     # default = enabled equity strategies (paper-test profile runs all six 5m ones)
+    # plus the always-present DISCOVERED_EQ channel (empty until specs register)
     assert {s.name for s in strats} == {
         "orb", "vwap_reversion", "vwap_pullback", "momentum_breakout",
-        "gap", "rsi2_scalp",
+        "gap", "rsi2_scalp", "DISCOVERED_EQ",
     }
     only = build_strategies(["orb"])
     assert [s.name for s in only] == ["orb"]
