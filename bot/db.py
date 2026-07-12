@@ -126,6 +126,20 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_positions_status ON positions (status, mode);
     CREATE INDEX IF NOT EXISTS idx_bars_ts ON bars_1m (ts);
     """,
+    # 002 — multi-variant track records: each strategy VARIANT (a param-set or a
+    # discovered spec) gets its own attribution key so many variants can trade the
+    # same instrument concurrently and each builds an independent ledger. The
+    # one-per-instrument lock is enforced in-memory (bot/risk.py, scoped to the
+    # live book) — NOT a DB UNIQUE constraint, which would wrongly block re-entry
+    # across sessions. These composite indexes just make per-variant reads fast.
+    """
+    ALTER TABLE positions ADD COLUMN variant_key TEXT;
+    ALTER TABLE trades ADD COLUMN variant_key TEXT;
+    UPDATE positions SET variant_key = strategy WHERE variant_key IS NULL;
+    UPDATE trades SET variant_key = strategy WHERE variant_key IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_trades_variant ON trades (variant_key, exit_ts);
+    CREATE INDEX IF NOT EXISTS idx_positions_variant ON positions (variant_key, status);
+    """,
 ]
 
 _local = threading.local()
@@ -224,10 +238,11 @@ def bar_dates(symbol: str | None = None) -> list[str]:
 # --- positions / trades -----------------------------------------------------
 
 def open_position(**kw) -> int:
+    kw.setdefault("variant_key", kw.get("strategy"))
     cur = connect().execute(
-        "INSERT INTO positions (run_id, mode, strategy, symbol, side, qty, entry_ts, "
-        "entry_price, stop_price, target_price, margin_used, status, updated_at) "
-        "VALUES (:run_id, :mode, :strategy, :symbol, :side, :qty, :entry_ts, "
+        "INSERT INTO positions (run_id, mode, strategy, variant_key, symbol, side, qty, "
+        "entry_ts, entry_price, stop_price, target_price, margin_used, status, updated_at) "
+        "VALUES (:run_id, :mode, :strategy, :variant_key, :symbol, :side, :qty, :entry_ts, "
         ":entry_price, :stop_price, :target_price, :margin_used, 'OPEN', :entry_ts)",
         kw,
     )
@@ -255,13 +270,14 @@ def open_positions(mode: str) -> list[sqlite3.Row]:
 
 
 def record_trade(**kw) -> int:
+    kw.setdefault("variant_key", kw.get("strategy"))
     cur = connect().execute(
-        "INSERT INTO trades (run_id, mode, strategy, symbol, side, qty, entry_ts, entry_price, "
-        "exit_ts, exit_price, gross_pnl, costs, net_pnl, r_multiple, planned_stop, "
+        "INSERT INTO trades (run_id, mode, strategy, variant_key, symbol, side, qty, entry_ts, "
+        "entry_price, exit_ts, exit_price, gross_pnl, costs, net_pnl, r_multiple, planned_stop, "
         "planned_target, exit_reason) "
-        "VALUES (:run_id, :mode, :strategy, :symbol, :side, :qty, :entry_ts, :entry_price, "
-        ":exit_ts, :exit_price, :gross_pnl, :costs, :net_pnl, :r_multiple, :planned_stop, "
-        ":planned_target, :exit_reason)",
+        "VALUES (:run_id, :mode, :strategy, :variant_key, :symbol, :side, :qty, :entry_ts, "
+        ":entry_price, :exit_ts, :exit_price, :gross_pnl, :costs, :net_pnl, :r_multiple, "
+        ":planned_stop, :planned_target, :exit_reason)",
         kw,
     )
     connect().commit()

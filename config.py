@@ -110,21 +110,25 @@ FYERS_FEED_MAX_ERRORS = 5
 # ---------------------------------------------------------------------------
 # Capital, sizing, risk (paper)
 # ---------------------------------------------------------------------------
-PAPER_STARTING_CASH = 100_000.0
-RISK_PER_TRADE_PCT = 1.0          # % of current equity risked between entry and stop
-MAX_NOTIONAL_PCT = 60.0           # single position notional cap, % of equity
+# PAPER-TEST PROFILE (2026-07): ₹20L book, deliberately SMALL trades, and every
+# strategy allowed to trade the SAME symbol in parallel so they can be compared
+# head-to-head on identical setups. Costs/brokerage are fully modelled (bot/costs.py)
+# so small trades show their true fee drag. Tighten these before any live use.
+PAPER_STARTING_CASH = 2_000_000.0   # ₹20 lakh paper equity book
+RISK_PER_TRADE_PCT = 0.25         # small: ~₹5,000 risk per trade on a ₹20L book
+MAX_NOTIONAL_PCT = 5.0            # small: single position notional cap ~₹1L
 INTRADAY_LEVERAGE = 5.0           # MIS margin = notional / leverage
 MAX_MARGIN_PCT = 90.0             # total margin in use, % of equity
 MIN_QTY = 1
 
-MAX_DAILY_LOSS_PCT = 2.0          # realized+unrealized day loss -> square off + halt
-MAX_ENTRIES_PER_DAY = 4           # portfolio-wide: only the highest-conviction signals
+MAX_DAILY_LOSS_PCT = 5.0          # testing headroom (was 2.0) so a bad day doesn't halt data collection
+MAX_ENTRIES_PER_DAY = 200         # testing: let every strategy fire (was 4)
 REGIME_FILTER_ENABLED = True      # longs need NIFTY >= day open; shorts need NIFTY <= open
-MAX_CONCURRENT_POSITIONS = 6
-MAX_POSITIONS_PER_STRATEGY = 3
-MAX_POSITIONS_PER_SYMBOL = 1      # portfolio-wide, first signal wins
-MAX_TRADES_PER_DAY_PER_STRATEGY = 10
-CONSECUTIVE_LOSSES_TO_BENCH = 3   # per strategy, per day
+MAX_CONCURRENT_POSITIONS = 40     # many small parallel test positions (was 6)
+MAX_POSITIONS_PER_STRATEGY = 10   # was 3
+MAX_POSITIONS_PER_SYMBOL = 8      # allow up to 8 different strategies on ONE symbol (was 1, first-wins)
+MAX_TRADES_PER_DAY_PER_STRATEGY = 30   # was 10
+CONSECUTIVE_LOSSES_TO_BENCH = 99  # testing: don't bench a strategy mid-test (was 3)
 
 # Circuit breaker on index shock: pause new entries.
 CIRCUIT_INDEX_MOVE_15M_PCT = 1.0
@@ -160,10 +164,10 @@ STRATEGY_PARAMS = {
         "target_r": 2.0,
         "max_trades_per_direction": 1,
     },
-    # Disabled by default: PF 0.13-0.37 across June-July 2026 backtests — the
-    # edge doesn't clear intraday costs. Re-test via --strategies vwap_reversion.
+    # Backtested PF 0.13-0.37 (edge doesn't clear costs) — ON now only to gather
+    # forward paper-test data alongside the others. Not a profit expectation.
     "vwap_reversion": {
-        "enabled": False,
+        "enabled": True,
         "entry_start": "10:00",
         "entry_end": "14:30",
         "band_sigma": 2.5,
@@ -268,9 +272,10 @@ STRATEGY_PARAMS = {
         "exit_time": "15:00",
         "max_trades_per_day": 1,
     },
-    # Disabled by default: 4-17% win rate in backtests, costs dwarf the edge.
+    # Backtested 4-17% win rate (costs dwarf the edge) — ON now only to gather
+    # forward paper-test data alongside the others. Not a profit expectation.
     "rsi2_scalp": {
-        "enabled": False,
+        "enabled": True,
         "entry_start": "09:45",
         "entry_end": "14:30",
         "rsi_period": 2,

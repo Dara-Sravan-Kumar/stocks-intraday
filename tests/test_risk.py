@@ -36,24 +36,37 @@ def approve(engine, day, *, strategy="orb", symbol="X", entry=500.0, stop=495.0,
     )
 
 
+def _expected_qty(eq, entry, stop, margin_used=0.0):
+    """Mirror approve()'s equity sizing: risk, then notional cap, then margin cap."""
+    qty = math.floor(eq * config.RISK_PER_TRADE_PCT / 100.0 / abs(entry - stop))
+    max_notional = eq * config.MAX_NOTIONAL_PCT / 100.0
+    if qty * entry > max_notional:
+        qty = math.floor(max_notional / entry)
+    margin_cap = eq * config.MAX_MARGIN_PCT / 100.0
+    if margin_used + qty * entry / config.INTRADAY_LEVERAGE > margin_cap:
+        afford = (margin_cap - margin_used) * config.INTRADAY_LEVERAGE
+        qty = min(qty, math.floor(afford / entry))
+    return qty
+
+
 def test_sizing_formula():
     engine = RiskEngine()
-    day = DayState(start_equity=100_000)
-    res = approve(engine, day, entry=500.0, stop=490.0)
+    eq = 100_000
+    day = DayState(start_equity=eq)
+    res = approve(engine, day, entry=500.0, stop=490.0, equity=eq)
     assert isinstance(res, Approval)
-    # risk 1% of 1L = 1000; risk/share = 10 -> 100 shares
-    # notional 100*500 = 50,000 <= 60% cap -> stands
-    assert res.qty == 100
-    assert res.margin == pytest.approx(100 * 500 / config.INTRADAY_LEVERAGE)
+    assert res.qty == _expected_qty(eq, 500.0, 490.0)
+    assert res.margin == pytest.approx(res.qty * 500 / config.INTRADAY_LEVERAGE)
 
 
 def test_notional_cap_reduces_qty():
     engine = RiskEngine()
-    day = DayState(start_equity=100_000)
-    # tight-ish stop -> huge qty by risk; capped by 60% notional
-    res = approve(engine, day, entry=500.0, stop=498.0)
+    eq = 100_000
+    day = DayState(start_equity=eq)
+    # tight-ish stop -> large qty by risk; capped by the notional cap
+    res = approve(engine, day, entry=500.0, stop=498.0, equity=eq)
     assert isinstance(res, Approval)
-    assert res.qty == math.floor(60_000 / 500)
+    assert res.qty == math.floor(eq * config.MAX_NOTIONAL_PCT / 100.0 / 500)
 
 
 def test_stop_distance_gate_blocks_fee_eaten_setups():
@@ -65,11 +78,13 @@ def test_stop_distance_gate_blocks_fee_eaten_setups():
 
 def test_margin_cap_reduces_qty():
     engine = RiskEngine()
-    day = DayState(start_equity=100_000)
-    res = approve(engine, day, entry=500.0, stop=498.0, margin_used=85_000)
-    # margin cap 90k; only 5k free -> 25k notional -> 50 shares
+    eq = 100_000
+    day = DayState(start_equity=eq)
+    margin_cap = eq * config.MAX_MARGIN_PCT / 100.0
+    used = margin_cap - 500              # only ₹500 margin headroom -> margin binds below notional
+    res = approve(engine, day, entry=500.0, stop=498.0, margin_used=used, equity=eq)
     assert isinstance(res, Approval)
-    assert res.qty == 50
+    assert res.qty == _expected_qty(eq, 500.0, 498.0, margin_used=used)
 
 
 def test_daily_halt_blocks():
@@ -81,9 +96,11 @@ def test_daily_halt_blocks():
 
 def test_daily_loss_breach_detection():
     engine = RiskEngine()
-    day = DayState(start_equity=100_000)
-    assert not engine.daily_loss_breached(98_100, day)
-    assert engine.daily_loss_breached(98_000, day)   # exactly -2%
+    eq = 100_000
+    day = DayState(start_equity=eq)
+    thresh = eq * (1 - config.MAX_DAILY_LOSS_PCT / 100.0)  # equity at exactly -MAX%
+    assert not engine.daily_loss_breached(thresh + 100, day)
+    assert engine.daily_loss_breached(thresh, day)
 
 
 def test_max_concurrent_positions():
@@ -94,7 +111,7 @@ def test_max_concurrent_positions():
     assert isinstance(res, Skip) and "concurrent" in res.reason
 
 
-def test_per_strategy_and_per_symbol_limits():
+def test_per_strategy_limit():
     engine = RiskEngine()
     day = DayState(start_equity=100_000)
     per_strat = [make_pos(strategy="orb", symbol=f"P{i}")
@@ -102,9 +119,28 @@ def test_per_strategy_and_per_symbol_limits():
     res = approve(engine, day, positions=per_strat, strategy="orb")
     assert isinstance(res, Skip) and "orb" in res.reason
 
-    res2 = approve(engine, day, positions=[make_pos(symbol="X")], symbol="X",
-                   strategy="gap")
-    assert isinstance(res2, Skip) and "X" in res2.reason
+
+def test_same_strategy_cannot_double_up_on_symbol():
+    engine = RiskEngine()
+    day = DayState(start_equity=100_000)
+    res = approve(engine, day, positions=[make_pos(strategy="gap", symbol="X")],
+                  symbol="X", strategy="gap")
+    assert isinstance(res, Skip) and "X" in res.reason
+
+
+def test_different_strategies_may_share_a_symbol():
+    """The paper-test behaviour: strategies compete on the same setup."""
+    engine = RiskEngine()
+    day = DayState(start_equity=100_000)
+    # a different strategy CAN take a symbol another strategy already holds
+    res = approve(engine, day, positions=[make_pos(strategy="orb", symbol="X")],
+                  symbol="X", strategy="gap")
+    assert isinstance(res, Approval)
+    # ...until MAX_POSITIONS_PER_SYMBOL distinct strategies are on it
+    crowd = [make_pos(strategy=f"s{i}", symbol="X")
+             for i in range(config.MAX_POSITIONS_PER_SYMBOL)]
+    res_full = approve(engine, day, positions=crowd, symbol="X", strategy="gap")
+    assert isinstance(res_full, Skip) and "X" in res_full.reason
 
 
 def test_trades_per_day_and_bench():

@@ -31,9 +31,10 @@ def bar5(o, h, l, c, v=10_000, at=None):  # noqa: E741
 
 def test_build_strategies_registry():
     strats = build_strategies()
-    # default = enabled-only (rsi2_scalp / vwap_reversion ship disabled)
+    # default = enabled equity strategies (paper-test profile runs all six 5m ones)
     assert {s.name for s in strats} == {
-        "orb", "vwap_pullback", "momentum_breakout", "gap",
+        "orb", "vwap_reversion", "vwap_pullback", "momentum_breakout",
+        "gap", "rsi2_scalp",
     }
     only = build_strategies(["orb"])
     assert [s.name for s in only] == ["orb"]

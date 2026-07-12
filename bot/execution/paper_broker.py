@@ -45,7 +45,8 @@ class PaperBroker(Broker):
     def open_position(self, strategy: str, symbol: str, side: str, qty: int,
                       ref_price: float, ts: datetime, stop: float,
                       target: float | None, margin: float | None = None,
-                      instrument: str = "EQ") -> Position | None:
+                      instrument: str = "EQ",
+                      variant_key: str = "") -> Position | None:
         fill = costmod.slippage_price(ref_price, side_is_buy=(side == LONG),
                                       instrument=instrument)
         if margin is None:
@@ -54,7 +55,7 @@ class PaperBroker(Broker):
             strategy=strategy, symbol=symbol, side=side, qty=qty,
             entry_ts=ts, entry_price=fill, stop_price=stop,
             target_price=target, margin_used=margin, planned_stop=stop,
-            instrument=instrument,
+            instrument=instrument, variant_key=variant_key or strategy,
         )
         self.positions.append(pos)
         return pos

@@ -87,7 +87,9 @@ def option_state(symbol="NSE:NIFTY26JUL24200CE", lot=75, premium=200.0):
 
 def approve_option(side=LONG, equity=300_000.0, premium=200.0, stop=130.0,
                    lot=75, margin_used=0.0):
-    engine = RiskEngine()
+    # Pin risk% so these lot-rounding/margin assertions are independent of the
+    # (deliberately small) paper-test profile in config.
+    engine = RiskEngine(risk_per_trade_pct=1.0)
     day = DayState(start_equity=equity)
     return engine.approve(
         strategy="opt_orb", symbol="NSE:NIFTY26JUL24200CE",

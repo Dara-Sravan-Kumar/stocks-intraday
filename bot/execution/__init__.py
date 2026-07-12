@@ -25,11 +25,16 @@ class Position:
     db_id: int | None = None
     mode: str = "PAPER"
     instrument: str = "EQ"    # EQ | OPT — selects cost model and slippage
+    variant_key: str = ""     # track-record identity; "" -> falls back to strategy
     scratch: dict = field(default_factory=dict)   # strategy-managed (trails etc.)
 
     @property
     def is_long(self) -> bool:
         return self.side == LONG
+
+    @property
+    def variant(self) -> str:
+        return self.variant_key or self.strategy
 
     def unrealized(self, last_price: float) -> float:
         diff = last_price - self.entry_price
@@ -59,7 +64,8 @@ class Broker(ABC):
     def open_position(self, strategy: str, symbol: str, side: str, qty: int,
                       ref_price: float, ts: datetime, stop: float,
                       target: float | None, margin: float | None = None,
-                      instrument: str = "EQ") -> Position | None: ...
+                      instrument: str = "EQ",
+                      variant_key: str = "") -> Position | None: ...
 
     @abstractmethod
     def close_position(self, pos: Position, ref_price: float, ts: datetime,

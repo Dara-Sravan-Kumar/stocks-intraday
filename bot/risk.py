@@ -111,27 +111,37 @@ class RiskEngine:
                 stop_price: float, sym_state: SymbolState,
                 open_positions: list[Position], equity: float,
                 margin_used: float, day: DayState,
-                now: datetime, side: str = "LONG") -> Approval | Skip:
+                now: datetime, side: str = "LONG",
+                variant_key: str | None = None) -> Approval | Skip:
+        # variant_key is the track-record identity (a param-set / discovered spec).
+        # None -> the strategy family is a single variant (classic behavior).
+        variant = variant_key or strategy
         if day.halted:
             return Skip(f"day halted: {day.halt_reason}")
         if day.entries_today >= config.MAX_ENTRIES_PER_DAY:
             return Skip(f"portfolio entry budget ({config.MAX_ENTRIES_PER_DAY}/day) spent")
         if day.circuit_paused_until and now < day.circuit_paused_until:
             return Skip("circuit breaker pause active")
-        if strategy in day.benched_strategies:
-            return Skip(f"{strategy} benched after "
+        if variant in day.benched_strategies:
+            return Skip(f"{variant} benched after "
                         f"{config.CONSECUTIVE_LOSSES_TO_BENCH} consecutive losses")
-        if day.trades_by_strategy.get(strategy, 0) >= config.MAX_TRADES_PER_DAY_PER_STRATEGY:
-            return Skip(f"{strategy} hit max trades/day")
+        if day.trades_by_strategy.get(variant, 0) >= config.MAX_TRADES_PER_DAY_PER_STRATEGY:
+            return Skip(f"{variant} hit max trades/day")
 
         if len(open_positions) >= self.max_concurrent:
             return Skip("max concurrent positions")
-        if sum(1 for p in open_positions if p.strategy == strategy) \
+        if sum(1 for p in open_positions if p.variant == variant) \
                 >= config.MAX_POSITIONS_PER_STRATEGY:
-            return Skip(f"{strategy} at max positions")
+            return Skip(f"{variant} at max positions")
+        # One position per (variant, symbol) — a variant can't double up on its own
+        # name — but DIFFERENT variants (other strategies OR other specs of the same
+        # family) may take the same symbol in parallel, so each builds its own track
+        # record on the same scarce intraday setup.
+        if any(p.symbol == symbol and p.variant == variant for p in open_positions):
+            return Skip(f"{variant} already holds {symbol}")
         if sum(1 for p in open_positions if p.symbol == symbol) \
                 >= config.MAX_POSITIONS_PER_SYMBOL:
-            return Skip(f"{symbol} already has a position")
+            return Skip(f"{symbol} at max strategies ({config.MAX_POSITIONS_PER_SYMBOL})")
 
         is_option = sym_state.option_meta is not None
         if not is_option:

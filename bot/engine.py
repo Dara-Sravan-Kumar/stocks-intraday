@@ -182,8 +182,11 @@ class Engine:
                 sigs = result if isinstance(result, list) else ([result] if result else [])
                 for sig in sigs:
                     self.n_signals += 1
-                    if any(p.signal.symbol == sig.symbol for p in self.pending):
-                        self._log_skip(sig.strategy, sig.symbol, "entry already pending")
+                    # per-VARIANT pending check: a variant skips only instruments
+                    # IT already has queued; other variants may still take them.
+                    if any(p.signal.symbol == sig.symbol and p.signal.variant == sig.variant
+                           for p in self.pending):
+                        self._log_skip(sig.variant, sig.symbol, "entry already pending")
                         continue
                     if sig.symbol == sym and not self.risk.regime_allows(sig.side, self.market):
                         # regime filter applies to directional equity/index trades,
@@ -197,8 +200,10 @@ class Engine:
         # the highest-conviction signals, not the alphabetically first ones.
         candidates.sort(key=lambda c: c[0], reverse=True)
         for _, sig in candidates:
-            if any(p.signal.symbol == sig.symbol for p in self.pending):
-                self._log_skip(sig.strategy, sig.symbol, "entry already pending")
+            if any(p.signal.symbol == sig.symbol and p.signal.variant == sig.variant
+                   for p in self.pending):
+                self._log_skip(sig.variant, sig.symbol,
+                               "entry already pending for this variant")
                 continue
             st = self.market.get(sig.symbol)
             if st is None or not (st.bars_5m or st.bars_1m):
@@ -213,9 +218,10 @@ class Engine:
                 equity=self.broker.equity(self.marks),
                 margin_used=self.broker.margin_used + pending_margin,
                 day=self.day, now=self.now, side=sig.side,
+                variant_key=sig.variant,
             )
             if isinstance(res, Skip):
-                self._log_skip(sig.strategy, sig.symbol, res.reason)
+                self._log_skip(sig.variant, sig.symbol, res.reason)
                 continue
             self.day.entries_today += 1
             self.pending.append(PendingEntry(sig, res, self.now))
@@ -238,10 +244,10 @@ class Engine:
             pos = self.broker.open_position(
                 sig.strategy, sig.symbol, sig.side, ap.qty,
                 ref_price=bar.open, ts=bar.ts, stop=sig.stop, target=sig.target,
-                margin=ap.margin, instrument=instrument,
+                margin=ap.margin, instrument=instrument, variant_key=sig.variant,
             )
             if pos is None:
-                self._log_skip(sig.strategy, sig.symbol, "broker rejected entry")
+                self._log_skip(sig.variant, sig.symbol, "broker rejected entry")
                 continue
             pos.mode = self.mode
             strat = self._strategy_by_name.get(sig.strategy)
@@ -250,6 +256,7 @@ class Engine:
             if self.persist:
                 pos.db_id = db.open_position(
                     run_id=self.run_id, mode=self.mode, strategy=sig.strategy,
+                    variant_key=sig.variant,
                     symbol=sig.symbol, side=sig.side, qty=ap.qty,
                     entry_ts=pos.entry_ts.isoformat(), entry_price=pos.entry_price,
                     stop_price=pos.stop_price, target_price=pos.target_price,
@@ -296,12 +303,13 @@ class Engine:
         trade = self.broker.close_position(pos, ref_price, ts, reason)
         self.n_trades += 1
         self.closed_trades.append(trade)
-        self.day.record_trade_result(pos.strategy, trade.net_pnl)
+        self.day.record_trade_result(pos.variant, trade.net_pnl)
         if self.persist:
             if pos.db_id:
                 db.close_position(pos.db_id, ts.isoformat())
             db.record_trade(
                 run_id=self.run_id, mode=self.mode, strategy=pos.strategy,
+                variant_key=pos.variant,
                 symbol=pos.symbol, side=pos.side, qty=pos.qty,
                 entry_ts=pos.entry_ts.isoformat(), entry_price=pos.entry_price,
                 exit_ts=ts.isoformat(), exit_price=trade.exit_price,

@@ -16,12 +16,20 @@ from bot.state import MarketState, SymbolState
 
 @dataclass(frozen=True)
 class Signal:
-    strategy: str
+    strategy: str            # managing channel/family (routes manage()/note_entry)
     symbol: str
     side: str                # LONG | SHORT
     stop: float
     target: float | None
     reason: str
+    variant_key: str | None = None   # track-record identity; None -> == strategy
+
+    @property
+    def variant(self) -> str:
+        """Attribution + uniqueness identity. Classic strategies: == strategy.
+        Discovered specs: the spec key, so many specs share one managing class
+        yet each keeps its own ledger and its own one-per-instrument lock."""
+        return self.variant_key or self.strategy
 
 
 @dataclass(frozen=True)
