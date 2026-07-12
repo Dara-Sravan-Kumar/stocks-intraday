@@ -63,9 +63,10 @@ class BacktestResult:
 
 
 def run_backtest(symbols: list[str], strategies: list[Strategy],
-                 start: date, end: date, persist: bool = False) -> BacktestResult:
+                 start: date, end: date, persist: bool = False,
+                 starting_cash: float | None = None) -> BacktestResult:
     result = BacktestResult()
-    equity = config.PAPER_STARTING_CASH
+    equity = starting_cash if starting_cash is not None else config.PAPER_STARTING_CASH
     available = set(db.bar_dates())   # once — a full-table scan per session leaks memory
     d = start
     while d <= end:
@@ -117,3 +118,93 @@ def max_drawdown_pct(equity_curve: list[tuple]) -> float:
         if peak > 0:
             max_dd = max(max_dd, (peak - eq) / peak * 100.0)
     return max_dd
+
+
+# --- shared on-demand runner (CLI + dashboard button) -----------------------
+
+#: period label -> (sessions to replay, history depth in days for an optional
+#: fetch). The on-demand backtest can pull MORE history than the light daily
+#: runs; depths are chosen to stay within what Fyers can actually return.
+PERIODS: dict[str, tuple[int, int]] = {
+    "1 week": (5, 10),
+    "1 month": (22, 45),
+    "3 months": (66, 130),
+    "6 months": (127, 260),
+}
+
+
+def summarize(result: BacktestResult, starting_cash: float | None = None) -> dict:
+    start_cash = starting_cash if starting_cash is not None else config.PAPER_STARTING_CASH
+    total_net = sum(result.daily_pnl.values())
+    final_eq = result.equity_curve[-1][1] if result.equity_curve else start_cash
+    green = sum(1 for v in result.daily_pnl.values() if v > 0)
+    return {
+        "sessions": len(result.sessions),
+        "trades": len(result.all_trades),
+        "total_net": total_net,
+        "final_equity": final_eq,
+        "max_dd_pct": max_drawdown_pct(result.equity_curve),
+        "green_days": green,
+        "profit_factor": result.profit_factor(),
+    }
+
+
+def _seed_strategies(channel: str = "DISCOVERED_EQ") -> list[Strategy]:
+    """The SEED_GENES library as a live ExprStrategy, for a seeds-only backtest
+    (equity only — index-option premium history isn't backtestable)."""
+    from bot.discovery.mixer import SEED_GENES
+    from bot.discovery.spec import StrategySpec
+    from bot.strategies.discovered import DiscoveredEquity
+
+    specs = [StrategySpec(name=f"seed_{i}", entry_expr=expr, channel="DISCOVERED_EQ",
+                          side=side, min_reward_risk=rr, source="manual")
+             for i, (expr, side, rr) in enumerate(SEED_GENES["DISCOVERED_EQ"])]
+    return [DiscoveredEquity(specs)]
+
+
+def run_and_save(*, period: str | None = None, start: date | None = None,
+                 end: date | None = None, symbols: list[str] | None = None,
+                 strategies: list[Strategy] | None = None, seeds_only: bool = False,
+                 max_instruments: int | None = None,
+                 starting_cash: float | None = None, persist: bool = False,
+                 fetch: bool = False, fetch_source: str = "fyers") -> tuple[BacktestResult, dict]:
+    """One entry point for a backtest run. Resolves a period (or explicit
+    start/end) against the cached bars, optionally fetching a deeper history
+    window, builds the fleet (or a seeds-only fleet), runs the replay, and
+    returns (result, summary). The DB is only written when persist/fetch is set."""
+    from bot.strategies import build_strategies
+
+    sessions, depth = PERIODS.get(period or "", (22, 45))
+    if symbols is None:
+        symbols = sorted(db.bar_symbols(exclude=set(config.INDEX_SYMBOLS)))
+    if max_instruments:
+        symbols = symbols[:max_instruments]
+
+    if fetch and (start is None or end is None):
+        end_guess = date.fromisoformat(db.bar_dates()[-1]) if db.bar_dates() else date.today()
+        _fetch(symbols, end_guess - timedelta(days=depth), end_guess, fetch_source)
+
+    dates = db.bar_dates()
+    if not dates:
+        return BacktestResult(), {"error": "no cached bars — fetch history first"}
+    if start is None or end is None:
+        end = date.fromisoformat(dates[-1])
+        start = date.fromisoformat(dates[-sessions:][0])
+
+    if strategies is None:
+        strategies = _seed_strategies() if seeds_only else build_strategies()
+    result = run_backtest(symbols, strategies, start, end,
+                          persist=persist, starting_cash=starting_cash)
+    return result, summarize(result, starting_cash)
+
+
+def _fetch(symbols: list[str], start: date, end: date, source: str) -> int:
+    from bot import history, instruments
+    all_syms = symbols + list(config.INDEX_SYMBOLS)
+    if source == "fyers":
+        return history.fetch_1m_fyers(all_syms, start, end)
+    if source == "dhan":
+        instr = instruments.load_instruments()
+        ids = {s: (instr[s].dhan_security_id or "") for s in symbols if s in instr}
+        return history.fetch_1m_dhan(ids, start, end)
+    return history.fetch_1m_yfinance(all_syms, start, end)

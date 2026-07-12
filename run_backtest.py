@@ -16,7 +16,7 @@ from rich.table import Table
 
 import config
 from bot import db, history, instruments
-from bot.backtest import max_drawdown_pct, run_backtest
+from bot.backtest import run_and_save
 from bot.strategies import build_strategies
 
 
@@ -68,7 +68,8 @@ def main() -> None:
             n = history.fetch_1m_yfinance(all_syms, start, end)
         console.print(f"stored {n:,} bars; dates in cache: {', '.join(db.bar_dates()[-25:])}")
 
-    result = run_backtest(symbols, strategies, start, end, persist=args.persist)
+    result, summary = run_and_save(start=start, end=end, symbols=symbols,
+                                   strategies=strategies, persist=args.persist)
     if not result.sessions:
         console.print("[red]No cached bars for that range — run with --fetch first.[/red]")
         return
@@ -86,15 +87,11 @@ def main() -> None:
         )
     console.print(table)
 
-    total_net = sum(result.daily_pnl.values())
-    final_eq = result.equity_curve[-1][1] if result.equity_curve else config.PAPER_STARTING_CASH
-    dd = max_drawdown_pct(result.equity_curve)
-    wins = sum(1 for v in result.daily_pnl.values() if v > 0)
     console.print(
-        f"\n[bold]Total net:[/bold] ₹{total_net:,.0f}  "
-        f"[bold]Final equity:[/bold] ₹{final_eq:,.0f}  "
-        f"[bold]Max DD:[/bold] {dd:.1f}%  "
-        f"[bold]Green days:[/bold] {wins}/{len(result.sessions)}"
+        f"\n[bold]Total net:[/bold] ₹{summary['total_net']:,.0f}  "
+        f"[bold]Final equity:[/bold] ₹{summary['final_equity']:,.0f}  "
+        f"[bold]Max DD:[/bold] {summary['max_dd_pct']:.1f}%  "
+        f"[bold]Green days:[/bold] {summary['green_days']}/{summary['sessions']}"
     )
 
 

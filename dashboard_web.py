@@ -81,7 +81,7 @@ MODE_OPTIONS = {
     "🔴 Live": ["LIVE"],
 }
 PAGES = ["📊 Summary", "🎯 Today's Picks", "🧾 All Trades", "📒 Ledger",
-         "📅 History", "🧪 Runs & Backtests", "🚫 Skips"]
+         "📅 History", "🧬 Fleet", "🧪 Runs & Backtests", "🚫 Skips"]
 
 head_l, head_r = st.columns([3, 2])
 head_l.title("📈 Intraday Bot — Nifty 50 + Bank Nifty")
@@ -594,6 +594,153 @@ def render_skips():
     st.dataframe(skips, width="stretch", hide_index=True, height=380)
 
 
+# ------------------------------------------------------------ fleet analysis
+
+def _variant_ledger() -> pd.DataFrame:
+    """Per-variant realized stats for the selected mode, enriched with the
+    discovered-spec metadata (entry_expr, channel, source, status)."""
+    led = q(
+        f"SELECT variant_key, strategy, COUNT(*) AS trades, "
+        f"SUM(net_pnl) AS net, "
+        f"SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END) AS wins, "
+        f"SUM(CASE WHEN net_pnl > 0 THEN net_pnl ELSE 0 END) AS gains, "
+        f"-SUM(CASE WHEN net_pnl < 0 THEN net_pnl ELSE 0 END) AS losses "
+        f"FROM trades WHERE {MW} GROUP BY variant_key, strategy", MP)
+    specs = q("SELECT name AS variant_key, channel, entry_expr, source, status, "
+              "created_at FROM discovered_specs")
+    if led.empty:
+        led = pd.DataFrame(columns=["variant_key", "strategy", "trades", "net",
+                                    "wins", "gains", "losses"])
+    merged = led.merge(specs, on="variant_key", how="outer")
+    merged["trades"] = merged["trades"].fillna(0).astype(int)
+    for c in ("net", "wins", "gains", "losses"):
+        merged[c] = merged[c].fillna(0.0)
+    # a variant with no discovered-spec row is a classic strategy
+    merged["channel"] = merged["channel"].fillna(merged["strategy"]).fillna("—")
+    merged["entry_expr"] = merged["entry_expr"].fillna("—")
+    merged["source"] = merged["source"].fillna("classic")
+    merged["status"] = merged["status"].fillna("ACTIVE")
+    merged["win%"] = (merged["wins"] / merged["trades"].replace(0, pd.NA) * 100).fillna(0)
+    merged["PF"] = (merged["gains"] / merged["losses"].replace(0, pd.NA))
+    return merged
+
+
+def render_fleet():
+    st.caption("Every strategy variant — classic + discovered + bred — with its "
+               "own track record. Discovered specs are DATA (a boolean entry_expr) "
+               "run through a whitelist-only interpreter; all trading is paper.")
+    v = _variant_ledger()
+
+    active_specs = q("SELECT channel, status, source FROM discovered_specs")
+    n_active_disc = int((active_specs["status"] == "ACTIVE").sum()) if not active_specs.empty else 0
+    traded = v[v["trades"] > 0]
+    total_trades = int(traded["trades"].sum())
+    fleet_wins = float(traded["wins"].sum())
+    fleet_wr = fleet_wins / total_trades * 100 if total_trades else 0.0
+    realized = float(traded["net"].sum())
+    # "graduates" = discovered specs that have proven out on a real forward ledger
+    disc = traded[traded["source"].isin(["discovered", "mixer"])]
+    graduates = int(((disc["trades"] >= 15) & (disc["net"] > 0)).sum()) if not disc.empty else 0
+
+    c = st.columns(6)
+    c[0].metric("Active variants", int((v["status"] == "ACTIVE").sum()))
+    c[1].metric("Discovered (active)", n_active_disc)
+    c[2].metric("Closed trades", f"{total_trades:,}")
+    c[3].metric("Fleet win-rate", f"{fleet_wr:.0f}%")
+    c[4].metric("Realized P&L", inr(realized))
+    c[5].metric("Graduates", graduates,
+                help="discovered/bred specs net-positive over ≥15 forward trades")
+
+    st.subheader("Per-channel breakdown")
+    if not traded.empty:
+        chan = traded.groupby("channel").agg(
+            variants=("variant_key", "nunique"), trades=("trades", "sum"),
+            net=("net", "sum"), wins=("wins", "sum")).reset_index()
+        chan["win%"] = (chan["wins"] / chan["trades"] * 100).round(0)
+        chan["net"] = chan["net"].round(0)
+        st.dataframe(chan[["channel", "variants", "trades", "win%", "net"]],
+                     width="stretch", hide_index=True)
+        st.subheader("Realized P&L by channel")
+        st.bar_chart(chan.set_index("channel")["net"])
+    else:
+        st.caption("No closed trades yet — variants build their ledgers as they trade.")
+
+    st.subheader("All variants (classic + discovered + bred)")
+    show = v.copy()
+    show["net"] = show["net"].round(0)
+    show["win%"] = show["win%"].round(0)
+    show["PF"] = show["PF"].round(2)
+    show = show.sort_values(["channel", "net"], ascending=[True, False])
+    st.dataframe(
+        show[["variant_key", "channel", "source", "status", "trades", "win%",
+              "net", "PF", "entry_expr"]],
+        width="stretch", hide_index=True, height=420,
+        column_config={"entry_expr": st.column_config.TextColumn("entry_expr", width="large")},
+    )
+
+    disc_specs = q("SELECT name, channel, source, status, entry_expr, gate_json, "
+                   "created_at FROM discovered_specs ORDER BY created_at DESC LIMIT 25")
+    if not disc_specs.empty:
+        st.subheader("Discovered / bred spotlight")
+        def _gate(g):
+            try:
+                d = json.loads(g) if g else {}
+                return d.get("reason", "")
+            except Exception:
+                return ""
+        disc_specs["gate"] = disc_specs["gate_json"].map(_gate)
+        st.dataframe(disc_specs[["name", "channel", "source", "status", "entry_expr",
+                                 "gate", "created_at"]],
+                     width="stretch", hide_index=True)
+
+    _render_backtest_runner()
+
+
+def _render_backtest_runner():
+    from bot.backtest import PERIODS
+
+    st.subheader("🧪 Run a backtest")
+    st.caption("Replays cached 1m bars through the real engine. Read-only — "
+               "results are held in this session, not written to the DB.")
+    with st.form("fleet_backtest"):
+        col = st.columns(4)
+        period = col[0].selectbox("Period", list(PERIODS), index=1)
+        max_instr = col[1].number_input("Max instruments", 1, 60, 15)
+        capital = col[2].number_input("Capital ₹", 100_000, 50_000_000,
+                                      int(config.PAPER_STARTING_CASH), step=100_000)
+        seeds_only = col[3].checkbox("Seeds only", value=False,
+                                     help="backtest only the SEED_GENES library (equity)")
+        submitted = st.form_submit_button("Run backtest")
+
+    if submitted:
+        from bot.backtest import run_and_save
+        with st.spinner(f"Replaying {period}…"):
+            try:
+                _, summary = run_and_save(period=period, max_instruments=int(max_instr),
+                                          starting_cash=float(capital), seeds_only=seeds_only)
+                st.session_state["fleet_bt"] = {"period": period, "summary": summary,
+                                                "seeds_only": seeds_only}
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Backtest failed: {exc}")
+
+    last = st.session_state.get("fleet_bt")
+    if last:
+        s = last["summary"]
+        if "error" in s:
+            st.warning(s["error"])
+        else:
+            st.caption(f"Last run · {last['period']}"
+                       + (" · seeds only" if last['seeds_only'] else ""))
+            m = st.columns(5)
+            m[0].metric("Sessions", s["sessions"])
+            m[1].metric("Trades", f"{s['trades']:,}")
+            m[2].metric("Net P&L", inr(s["total_net"]))
+            m[3].metric("Max DD", f"{s['max_dd_pct']:.1f}%")
+            pf = s["profit_factor"]
+            m[4].metric("Profit factor",
+                        "∞" if pf == float("inf") else (f"{pf:.2f}" if pf else "—"))
+
+
 # ------------------------------------------------------------ page dispatch
 
 def _auto(fn, secs):
@@ -604,7 +751,7 @@ def _auto(fn, secs):
         fn()
 
 
-tab_summary, tab_picks, tab_trades, tab_ledger, tab_hist, tab_runs, tab_skips = \
+tab_summary, tab_picks, tab_trades, tab_ledger, tab_hist, tab_fleet, tab_runs, tab_skips = \
     st.tabs(PAGES)
 
 with tab_summary:
@@ -617,6 +764,8 @@ with tab_ledger:
     render_ledger()
 with tab_hist:
     render_history()
+with tab_fleet:
+    render_fleet()
 with tab_runs:
     render_runs()
 with tab_skips:
