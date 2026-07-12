@@ -185,6 +185,9 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # Equity + options sessions run concurrently and share this file; WAL allows
+    # one writer at a time, so wait rather than error on a brief write collision.
+    conn.execute("PRAGMA busy_timeout=5000")
     _migrate(conn)
     _local.conn = conn
     return conn
