@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import logging
 import time as time_mod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 import config
 from bot import alerts, clock, db
 from bot.bars import Bar
 from bot.execution import Broker, ClosedTrade, Position
+from bot.indicators import atr_stop_floor
 from bot.feeds import Feed
 from bot.risk import Approval, DayState, RiskEngine, Skip
 from bot.state import MarketState
@@ -278,6 +279,7 @@ class Engine:
                         self._log_skip(sig.strategy, sym,
                                        f"regime filter: NIFTY against {sig.side}")
                         continue
+                    sig = self._apply_atr_stop_floor(sig, strat, st, sym)
                     candidates.append((st.ind.rvol() or 0.0, sig))
 
         # Phase 2: strongest activity first — the day's entry budget goes to
@@ -372,6 +374,34 @@ class Engine:
                 price = exit_fill_price(pos, bar, pos.target_price)
                 self._close(pos, price, bar.ts, "TARGET")
 
+    def _bars_held(self, pos: Position) -> int:
+        """STRATEGY-timeframe (5m) bars elapsed since a position was opened."""
+        now = self.now or pos.entry_ts
+        mins = (now - pos.entry_ts).total_seconds() / 60.0
+        return int(max(0.0, mins) // max(1, config.STRATEGY_INTERVAL_MIN))
+
+    def _apply_atr_stop_floor(self, sig: Signal, strat: Strategy,
+                              st, sym: str) -> Signal:
+        """Widen a noise-tight structure stop to MIN_STOP_ATR_MULT x ATR (clamped
+        to the strategy's max-risk ceiling). Equity classics only — options
+        (premium stops) and the discovered channels (flat gated stops) opt out."""
+        if (not getattr(strat, "use_atr_stop_floor", False)
+                or strat.requires_options
+                or sig.symbol != sym or st is None or st.option_meta is not None
+                or not st.bars_5m):
+            return sig
+        atr = st.ind.atr14.value
+        if not atr:
+            return sig   # ATR not ready — leave the stop as the strategy set it
+        ref = st.bars_5m[-1].close
+        ceiling = strat.p.get("max_risk_pct", config.ATR_STOP_FLOOR_MAX_RISK_PCT)
+        new_stop = atr_stop_floor(ref, sig.stop, atr, sig.side,
+                                  min_stop_atr_mult=config.MIN_STOP_ATR_MULT,
+                                  max_risk_pct=ceiling)
+        if new_stop is not None and new_stop != sig.stop:
+            return replace(sig, stop=new_stop)
+        return sig
+
     def _manage_positions(self, bar: Bar) -> None:
         st = self.market.get(bar.symbol)
         for pos in self._positions_for(bar.symbol):
@@ -384,6 +414,15 @@ class Engine:
                 self._warn(f"{pos.strategy} manage({pos.symbol}) raised: {exc}")
                 continue
             if req is not None:
+                # Grace period: a SOFT "setup broken" exit reads the instrument's
+                # absolute state, which is often already broken at entry — suppress
+                # it until the position has been held the minimum number of bars.
+                # Hard stop/target (engine) and square-off are never gated here.
+                if req.soft and self._bars_held(pos) < config.MIN_HOLD_BARS_BEFORE_SOFT_EXIT:
+                    if self.persist and pos.db_id:
+                        db.update_position(pos.db_id, stop_price=pos.stop_price,
+                                           updated_at=bar.ts.isoformat())
+                    continue
                 self._close(pos, bar.close, bar.ts, req.reason)
             elif self.persist and pos.db_id:
                 db.update_position(pos.db_id, stop_price=pos.stop_price,

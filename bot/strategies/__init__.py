@@ -35,11 +35,25 @@ class Signal:
 @dataclass(frozen=True)
 class ExitRequest:
     reason: str              # becomes trades.exit_reason
+    soft: bool = False       # True -> a "setup broken" exit that reads the
+                             # instrument's ABSOLUTE state (below-VWAP, RSI left
+                             # oversold, structure broken). The engine suppresses
+                             # these until the position has been held
+                             # MIN_HOLD_BARS_BEFORE_SOFT_EXIT bars, so a state
+                             # that was already broken at entry can't guillotine
+                             # the trade on bar 1. Time stops and stop/target
+                             # hits are NOT soft — they fire on any bar.
 
 
 class Strategy(ABC):
     name: str = "base"
     requires_options: bool = False   # True -> only loaded in run_live --options
+    # Apply the ATR-based minimum-stop floor (engine-side) to this strategy's
+    # signals. True for the classic strategies, whose stops are derived from
+    # support/structure and can sit inside per-bar noise. The discovered channels
+    # use a deliberate flat-% stop the gate replays exactly, so they opt out to
+    # keep live and gate stops identical.
+    use_atr_stop_floor: bool = True
 
     def __init__(self, params: dict | None = None):
         self.p = params if params is not None else config.STRATEGY_PARAMS[self.name]

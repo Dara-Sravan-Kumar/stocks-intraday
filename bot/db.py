@@ -338,6 +338,32 @@ def realized_net_pnl(mode: str) -> float:
     return float(row["s"])
 
 
+def recent_closed_trades(mode: str, limit: int) -> list[sqlite3.Row]:
+    """The most-recent `limit` closed trades for a mode (newest first). Every row
+    in `trades` is a closed round trip (it's written on close), so this is simply
+    the tail of the ledger — what the daily post-mortem reviews."""
+    return list(connect().execute(
+        "SELECT * FROM trades WHERE mode=? ORDER BY exit_ts DESC LIMIT ?",
+        (mode, int(limit)),
+    ))
+
+
+def variant_ledger_stats(mode: str) -> list[sqlite3.Row]:
+    """Per-variant realized performance for a mode: trade count, wins, gross
+    win/loss and net — enough to rank variants by profit factor for the
+    discovery performance digest."""
+    return list(connect().execute(
+        "SELECT variant_key, "
+        "COUNT(*) AS trades, "
+        "COALESCE(SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END), 0) AS wins, "
+        "COALESCE(SUM(CASE WHEN net_pnl > 0 THEN net_pnl ELSE 0 END), 0) AS gross_win, "
+        "COALESCE(-SUM(CASE WHEN net_pnl < 0 THEN net_pnl ELSE 0 END), 0) AS gross_loss, "
+        "COALESCE(SUM(net_pnl), 0) AS net "
+        "FROM trades WHERE mode=? GROUP BY variant_key",
+        (mode,),
+    ))
+
+
 # --- orders / equity / skips / stats ---------------------------------------
 
 def record_order(**kw) -> int:

@@ -45,8 +45,10 @@ class Rsi2Scalp(Strategy):
             return ExitRequest("TIME")
         rsi = st.ind.rsi2.value
         if rsi is not None:
+            # Absolute-state exit: RSI leaving oversold/overbought can already be
+            # true on the entry bar, so it's SOFT — grace-gated by the engine.
             if pos.is_long and rsi > self.p["exit_rsi_long"]:
-                return ExitRequest("RSI_EXIT")
+                return ExitRequest("RSI_EXIT", soft=True)
             if not pos.is_long and rsi < self.p["exit_rsi_short"]:
-                return ExitRequest("RSI_EXIT")
+                return ExitRequest("RSI_EXIT", soft=True)
         return None

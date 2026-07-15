@@ -91,6 +91,13 @@ def _replay_session(spec: StrategySpec, compiled: CompiledExpr, sess: _Session,
     pos_bars = 0
     stop_lvl = target_lvl = 0.0
 
+    # Exit rules mirror the live engine: the only exits here are hard stop/target
+    # (fire on any bar), a max-hold time-exit ceiling, and end-of-day square-off —
+    # all of which are exempt from the MIN_HOLD_BARS_BEFORE_SOFT_EXIT grace period
+    # (that grace suppresses only ABSOLUTE-state "setup broken" soft exits, which
+    # the discovered-spec model doesn't use). So the gate already judges specs
+    # under the same exit rules as live; hold_bars_max (>= the grace) is a ceiling,
+    # never an early soft exit.
     for bar in sess.bars:
         if pos_entry is not None:
             pos_bars_completed = pos_bars   # 5m bars elapsed since entry

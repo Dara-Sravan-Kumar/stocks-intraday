@@ -340,6 +340,28 @@ MIN_AVG_1M_TURNOVER = 500_000.0   # rupees/minute, 10d average — keeps fills r
 MIN_STOP_DISTANCE_PCT = 0.35
 
 # ---------------------------------------------------------------------------
+# Exit correctness (intraday)
+# ---------------------------------------------------------------------------
+# Grace period for SOFT exits. A "setup broken" exit reads the instrument's
+# ABSOLUTE state (e.g. RSI leaving oversold, a close back below VWAP) — which is
+# often already "broken" at entry, so on the first bar it fires immediately and
+# guillotines the trade before the thesis has a chance. Suppress any SOFT exit
+# until the position has been held at least this many STRATEGY-timeframe bars
+# (5m). Hard stop/target hits and the end-of-day square-off are NOT gated — they
+# fire on any bar, including the first. The backtest gate applies the same rule.
+MIN_HOLD_BARS_BEFORE_SOFT_EXIT = 2
+
+# Minimum stop distance as a multiple of Wilder ATR(14) on the 5m timeframe. A
+# structure/support pivot sitting just under price yields a sub-noise stop that
+# routine per-bar volatility tags on bar 1 (a top intraday loss driver). Floor a
+# too-tight stop at MIN_STOP_ATR_MULT x ATR so it sits outside normal noise —
+# always clamped to the strategy's max-risk ceiling (falling back to
+# ATR_STOP_FLOOR_MAX_RISK_PCT) so it can never widen risk past the cap. No-ops
+# when ATR isn't computed yet (too little history) or the multiple is 0.
+MIN_STOP_ATR_MULT = 1.2
+ATR_STOP_FLOOR_MAX_RISK_PCT = 1.0     # ceiling when a strategy has no max_risk_pct
+
+# ---------------------------------------------------------------------------
 # LIVE trading gates. The bot NEVER edits these. All must pass:
 #   1. LIVE_TRADING_ENABLED = True                 (edit this file)
 #   2. strategy in LIVE_STRATEGY_ALLOWLIST         (edit this file)
@@ -399,6 +421,10 @@ def discord_settings() -> dict:
         "webhook_url": os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
         "bot_token": os.getenv("DISCORD_BOT_TOKEN", "").strip(),
         "channel_id": os.getenv("DISCORD_CHANNEL_ID", "").strip(),
+        # Optional dedicated channel for health/failure alerts (bot-token mode).
+        # Falls back to channel_id when unset. Webhook mode has one URL, so this
+        # is ignored there.
+        "alerts_channel": os.getenv("DISCORD_ALERTS_CHANNEL_ID", "").strip(),
     }
 
 
@@ -441,9 +467,27 @@ DISCOVERED_RETIRE_MODES = ("PAPER", "PAPER-OPT", "BACKTEST")
 # Claude CLI (subscription-billed `claude -p`, NOT the paid API).
 DISCOVERY_LLM_ENABLED = True
 CLAUDE_CLI = "claude"                  # resolved on PATH; overridable
+DISCOVERY_LLM_MODEL = "sonnet"         # reasoning quality > cost for R&D calls
 DISCOVERY_N_PER_RUN = 6                # strategies requested per discovery call
 DISCOVERY_TIMEOUT_SEC = 240
+# Web discovery: let the discoverer SEARCH THE WEB (Claude CLI --allowedTools
+# WebSearch) for currently-published intraday playbooks, not just its own
+# training. Slower (search + reasoning), so it gets a longer timeout. Off ->
+# a plain offline `claude -p` proposal.
+DISCOVERY_WEB_ENABLED = True
+DISCOVERY_WEB_TIMEOUT_SEC = 600
 # Genetic mixer (Phase 4)
 MIXER_ENABLED = True
 MIXER_OFFSPRING_PER_RUN = 6
 MIXER_RNG_SEED = 1729                  # deterministic breeding (tests + reproducibility)
+
+# ---------------------------------------------------------------------------
+# Reflective R&D loop — daily trade post-mortem (bot/discovery/postmortem.py).
+# After the market closes, review the most-recent CLOSED intraday trades via the
+# Claude CLI and turn systematic failure modes into lessons that bias the next
+# day's discovery. Fully guarded: a post-mortem failure never affects a run.
+# ---------------------------------------------------------------------------
+POSTMORTEM_ENABLED = True
+POSTMORTEM_MODE = "PAPER"              # which book to review (the equity paper book)
+POSTMORTEM_LOOKBACK_TRADES = 40       # most-recent closed trades to diagnose
+POSTMORTEM_MIN_TRADES = 6             # below this there's too little signal

@@ -89,6 +89,32 @@ class WilderAtr:
         return self.value
 
 
+def atr_stop_floor(entry: float | None, stop: float | None, atr: float | None,
+                   side: str, *, min_stop_atr_mult: float,
+                   max_risk_pct: float) -> float | None:
+    """Widen a too-tight stop to at least `min_stop_atr_mult` x ATR, so a
+    support/structure level sitting just under price can't produce a stop inside
+    per-bar noise. Always clamped to `max_risk_pct` so the floor can never widen
+    risk past the ceiling. Only ever widens — a stop already beyond the floor is
+    returned unchanged.
+
+    No-ops (returns `stop` untouched) when ATR is unavailable (None/0 — too
+    little history), the multiple/ceiling is disabled (<=0), or entry/stop are
+    missing. `side` is LONG or SHORT (a short's stop sits above entry).
+    """
+    if not entry or entry <= 0 or stop is None:
+        return stop
+    if not atr or atr <= 0 or min_stop_atr_mult <= 0 or max_risk_pct <= 0:
+        return stop
+    risk_pct = abs(entry - stop) / entry * 100.0
+    atr_pct = atr / entry * 100.0
+    min_stop_pct = min(min_stop_atr_mult * atr_pct, max_risk_pct)
+    if risk_pct >= min_stop_pct:
+        return stop
+    return (entry * (1 - min_stop_pct / 100.0) if side == "LONG"
+            else entry * (1 + min_stop_pct / 100.0))
+
+
 @dataclass
 class PrevDayLevels:
     """Reference levels computed from history during warmup."""

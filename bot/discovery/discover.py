@@ -75,7 +75,42 @@ class DiscoverReport:
                 f"registered {len(self.registered)}, rejected {len(self.rejected)}")
 
 
-def build_prompt(channel: str, existing_exprs: list[str], n: int) -> str:
+def _performance_digest(mode: str, *, top: int = 3) -> str:
+    """Compact read of how the live fleet is ACTUALLY doing on `mode`: overall
+    win rate plus the best/worst variants by profit factor. Fed into the
+    discovery prompt so proposals answer what's really failing on this book.
+    Returns '' when there's no closed-trade history yet."""
+    rows = [r for r in db.variant_ledger_stats(mode) if r["trades"]]
+    if not rows:
+        return ""
+
+    def pf(r) -> float:
+        gl = r["gross_loss"]
+        return float("inf") if gl <= 0 else r["gross_win"] / gl
+
+    def line(r) -> str:
+        gl = r["gross_loss"]
+        pf_s = "inf" if gl <= 0 else f"{r['gross_win'] / gl:.2f}"
+        wr = r["wins"] / r["trades"] * 100.0 if r["trades"] else 0.0
+        return (f"  - {r['variant_key']}: {r['trades']} trades, {wr:.0f}% win, "
+                f"PF {pf_s}, net Rs{r['net']:,.0f}")
+
+    ranked = sorted(rows, key=pf, reverse=True)
+    total = sum(r["trades"] for r in rows)
+    wins = sum(r["wins"] for r in rows)
+    overall_wr = wins / total * 100.0 if total else 0.0
+    parts = [f"  Overall: {total} closed trades, {overall_wr:.0f}% win rate.",
+             "  Best variants (by profit factor):"]
+    parts += [line(r) for r in ranked[:top]]
+    parts.append("  Worst variants:")
+    parts += [line(r) for r in ranked[-top:]]
+    return "\n".join(parts)
+
+
+def build_prompt(channel: str, existing_exprs: list[str], n: int, *,
+                 performance: str | None = None,
+                 lessons: list[str] | None = None,
+                 web: bool = False) -> str:
     vocab = sorted(channel_vocab(channel))
     lines = [f"- {f}: {_GLOSSARY[f]}" if f in _GLOSSARY else f"- {f}" for f in vocab]
     where = ("on NIFTY/BANKNIFTY INDEX structure — you buy the ATM option, so "
@@ -83,6 +118,22 @@ def build_prompt(channel: str, existing_exprs: list[str], n: int) -> str:
              if channel == "DISCOVERED_OPT"
              else "on individual NSE large-cap STOCKS (full vocabulary available)")
     existing = "\n".join(f"- {e}" for e in existing_exprs[:40]) or "(none yet)"
+    source = (
+        "SEARCH THE WEB for INTRADAY trading strategies traders/quants are "
+        "currently publishing for NSE India / global equities (recent articles, "
+        "blogs, papers) — then translate the most promising same-day ones into "
+        "specs."
+        if web else
+        f"Draw on published intraday playbooks such as: {_EXAMPLES}."
+    )
+    context = ""
+    if performance:
+        context += ("\nHow this bot's live fleet is ACTUALLY performing "
+                    "(bias proposals toward fixing the worst):\n" + performance + "\n")
+    if lessons:
+        context += ("\nLessons from a post-mortem of this book's own recent closed "
+                    "trades — bias your proposals to ADDRESS these:\n"
+                    + "\n".join(f"  - {x}" for x in lessons) + "\n")
     return f"""You are proposing published, well-known INTRADAY trading strategies for an
 automated Indian-market paper-trading bot. Signals are evaluated {where}.
 
@@ -91,8 +142,8 @@ automated Indian-market paper-trading bot. Signals are evaluated {where}.
 ALLOWED FIELD NAMES (the ONLY names you may use):
 {chr(10).join(lines)}
 
-Draw on published intraday playbooks such as: {_EXAMPLES}.
-
+{source}
+{context}
 Already-registered entry_exprs (propose DISTINCT ideas, not variants of these):
 {existing}
 
@@ -105,20 +156,33 @@ Return STRICT JSON, no prose, no code fence:
 Propose {n} strategies."""
 
 
-def _claude_cli(prompt: str) -> str:
-    """Call the Claude CLI in print mode. Subscription-billed, not the API."""
+def _claude_cli(prompt: str, *, allowed_tools: list[str] | None = None,
+                timeout: int | None = None) -> str:
+    """Call the Claude CLI in print mode. Subscription-billed, NOT the paid API.
+
+    `allowed_tools` whitelists Claude Code tools for this call (e.g. ["WebSearch"]);
+    in headless `-p` mode a tool not on the list is auto-denied, never prompted.
+    `timeout` overrides the default for slower tool-using (web) calls."""
     cli = shutil.which(config.CLAUDE_CLI) or config.CLAUDE_CLI
+    argv = [cli, "-p", "--model", config.DISCOVERY_LLM_MODEL]
+    if allowed_tools:
+        # value is comma-joined; the prompt goes on STDIN (not a positional) so
+        # a multi-value tools flag can't swallow it.
+        argv += ["--allowedTools", ",".join(allowed_tools)]
     proc = subprocess.run(
-        [cli, "-p", prompt],
-        capture_output=True, text=True, timeout=config.DISCOVERY_TIMEOUT_SEC,
+        argv, input=prompt, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+        timeout=timeout or config.DISCOVERY_TIMEOUT_SEC,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"claude CLI exit {proc.returncode}: {proc.stderr[:400]}")
+        raise RuntimeError(f"claude CLI exit {proc.returncode}: {(proc.stderr or '')[:400]}")
     return proc.stdout
 
 
-def _extract_json(text: str) -> dict:
-    """Pull the {...} object out of a CLI response, tolerating code fences/prose."""
+def _extract_json(text: str, *, require_key: str | None = "strategies") -> dict:
+    """Pull the first {...} object out of a CLI response, tolerating code
+    fences/prose. When `require_key` is set, only an object containing that key
+    is accepted (so a stray JSON snippet in prose is skipped)."""
     if not text:
         raise ValueError("empty response")
     start = text.find("{")
@@ -132,27 +196,43 @@ def _extract_json(text: str) -> dict:
                 if depth == 0:
                     try:
                         obj = json.loads(text[start:i + 1])
-                        if isinstance(obj, dict) and "strategies" in obj:
+                        if isinstance(obj, dict) and (require_key is None
+                                                      or require_key in obj):
                             return obj
                     except json.JSONDecodeError:
                         break
         start = text.find("{", start + 1)
-    raise ValueError("no strategies JSON object found in response")
+    raise ValueError(f"no JSON object with '{require_key}' found in response")
 
 
 def discover_and_register(channel: str = "DISCOVERED_EQ", *, n: int | None = None,
                           caller=None, run_gate: bool = True,
-                          histories=None) -> DiscoverReport:
+                          histories=None, lessons: list[str] | None = None,
+                          performance: str | None = None,
+                          web: bool | None = None) -> DiscoverReport:
     """Propose N strategies for `channel` and register those that pass the gate.
-    `caller(prompt)->str` is injectable so tests never spawn the CLI."""
+
+    `caller(prompt)->str` is injectable so tests never spawn the CLI. `lessons`
+    (from the daily post-mortem) and `performance` (the live-fleet digest) are
+    woven into the prompt so proposals target what's actually failing. `web`
+    enables WebSearch (defaults to config.DISCOVERY_WEB_ENABLED)."""
     n = n or config.DISCOVERY_N_PER_RUN
     caller = caller or _claude_cli
+    if web is None:
+        web = getattr(config, "DISCOVERY_WEB_ENABLED", False)
     report = DiscoverReport(channel=channel)
 
     existing = [r["entry_expr"] for r in db.discovered_specs(channel=channel, status=None)]
-    prompt = build_prompt(channel, existing, n)
+    prompt = build_prompt(channel, existing, n, performance=performance,
+                          lessons=lessons, web=web)
     try:
-        raw = caller(prompt)
+        # Only pass tool/timeout kwargs to the real CLI caller; injected test
+        # callers take just the prompt.
+        if caller is _claude_cli and web:
+            raw = caller(prompt, allowed_tools=["WebSearch"],
+                         timeout=config.DISCOVERY_WEB_TIMEOUT_SEC)
+        else:
+            raw = caller(prompt)
         payload = _extract_json(raw)
     except Exception as exc:  # noqa: BLE001 — a discovery failure must never crash the run
         log.warning("discovery(%s) failed: %s", channel, exc)

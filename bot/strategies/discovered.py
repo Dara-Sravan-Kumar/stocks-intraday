@@ -35,6 +35,9 @@ class ExprStrategy(Strategy):
     """Base for the discovered channels. `name` IS the channel key."""
 
     channel = "DISCOVERED_EQ"
+    # Discovered specs use a flat-% stop the backtest gate replays exactly; don't
+    # let the engine widen it or live and gated stops would diverge.
+    use_atr_stop_floor = False
 
     def __init__(self, specs: list[StrategySpec] | None = None):
         # params are self-contained — discovered channels aren't in STRATEGY_PARAMS

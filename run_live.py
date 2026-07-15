@@ -222,16 +222,39 @@ def main() -> None:
     reports.promotion_readiness(console)
     if not replay_mode:
         alerts.send(f"**{session_date}** session done\n```{summary}```")
-        # Tail of the run: discover + breed once/day (expensive; LLM + backtests).
-        # Fully guarded — a discovery failure must never affect the trading run.
+        # Tail of the run: post-mortem -> discovery -> breed, once/day (expensive;
+        # LLM + backtests). Fully guarded — an R&D failure must never affect the
+        # trading run. Then a redacted health alert for anything that broke.
+        rep: dict = {}
         try:
             from bot.discovery.automation import run_daily_discovery
             rep = run_daily_discovery()
             if "skipped" not in rep:
+                pm = rep.get("postmortem", {})
+                if pm.get("diagnosis"):
+                    console.print(f"[dim]Post-mortem ({pm.get('reviewed', 0)} trades): "
+                                  f"{pm['diagnosis']}[/dim]")
                 console.print(f"[dim]Daily discovery: "
                               f"{'; '.join(f'{c}={v}' for c, v in rep['channels'].items())}[/dim]")
         except Exception as exc:  # noqa: BLE001
             log.warning("daily discovery failed: %s", exc)
+
+        # Health alert: live-feed/login failures (critical — intraday can't trade
+        # without fresh bars) plus any LLM/discovery failures the R&D loop flagged.
+        # Throttled hourly so repeated same-hour launches don't spam.
+        try:
+            from bot import health
+            failures = health.collect_failures(
+                feed_source=engine.feed.source_name,
+                require_fyers=engine.require_fyers_feed,
+                discovery_report=rep,
+            )
+            status = alerts.send_failure_alert(
+                failures, throttle_key="eod_health", throttle_minutes=55)
+            if failures:
+                console.print(f"[yellow]Health alert ({len(failures)}): {status}[/yellow]")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("health alert failed: %s", exc)
 
 
 if __name__ == "__main__":
