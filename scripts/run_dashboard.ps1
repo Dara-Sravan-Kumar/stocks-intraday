@@ -1,5 +1,6 @@
-# Starts the intraday bot dashboard on port 8503 (idempotent: exits if already up).
-# Register at logon:  schtasks or Task Scheduler -> run this script.
+# Starts the intraday bot dashboard on http://localhost:8503 (idempotent: exits if already up).
+# Launchable on demand from the win-task-dashboard hub (http://127.0.0.1:8787) via the
+# "Intraday StockBot Dashboard" scheduled task — see scripts\register_dashboard_task.ps1.
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 

@@ -1,5 +1,7 @@
 # stocks-intraday dashboard — fixed port so it never collides with
-# stocks-short-term (8501) or mcx-short-term (8502).
+# stocks-short-term (8501), mcx-short-term (8502) or the win-task-dashboard
+# launcher hub (8787). Launchable from that hub via the "Intraday StockBot
+# Dashboard" scheduled task (scripts\register_dashboard_task.ps1).
 [server]
 port = 8503
 headless = true

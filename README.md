@@ -23,7 +23,7 @@ python run_live.py                     # auto feed: Dhan if token present, else 
 
 # 4) Reports / dashboards
 python run_report.py                   # EOD + promotion-readiness table
-scripts\run_dashboard.ps1              # web dashboard on :8503 (8501/8502 belong to other bots)
+scripts\run_dashboard.ps1              # web dashboard on :8503 (or launch it from the 8787 hub)
 
 # 5) Auto-start every weekday at 08:55 IST
 powershell -ExecutionPolicy Bypass -File scripts\register_task.ps1
