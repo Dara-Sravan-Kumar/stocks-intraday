@@ -44,12 +44,14 @@ def setup_logging(session_date: str) -> None:
     )
 
 
-def make_feed(pref: str, symbols: list[str], instr: dict):
+def make_feed(pref: str, symbols: list[str], instr: dict, allow_degrade: bool = True):
     from bot import fyers_auth
     if pref in ("auto", "fyers") and fyers_auth.has_credentials():
         try:
             from bot.feeds.fyers_feed import FyersFeed
-            return FyersFeed(symbols)   # self-degrades to yfinance if token invalid
+            # self-degrades to yfinance if token invalid (unless allow_degrade
+            # is False, e.g. --live, where a feed failure aborts instead)
+            return FyersFeed(symbols, allow_degrade=allow_degrade)
         except Exception as exc:  # noqa: BLE001
             log.warning("Fyers feed unavailable (%s); trying next feed", exc)
     if pref == "fyers":
@@ -179,9 +181,10 @@ def main() -> None:
                           f"{session_date}T00:00", f"{session_date}T23:59")
     elif args.options:
         from bot.feeds.fyers_feed import FyersFeed
-        feed = FyersFeed(symbols)            # options need real-time premiums
+        # options have no yfinance equivalent: abort rather than degrade
+        feed = FyersFeed(symbols, allow_degrade=False)
     else:
-        feed = make_feed(args.feed, symbols, instr)
+        feed = make_feed(args.feed, symbols, instr, allow_degrade=not args.live)
 
     abandon_stale_positions(mode)
     if args.options:
@@ -189,10 +192,15 @@ def main() -> None:
         broker = PaperBroker(paper_start)    # options live trading not wired — paper only
     else:
         broker = make_broker(args.live and not replay_mode, console)
+    # Production paper policy: book ONLY on the real Fyers feed. A yfinance
+    # fallback/degrade freezes the book (scan/log/alert only). The intentional
+    # --feed yf (or --feed dhan) dev workflow and replays are exempt.
+    require_fyers_feed = (not replay_mode) and args.feed in ("auto", "fyers")
     engine = Engine(
         mode=mode, feed=feed, broker=broker, strategies=strategies,
         risk=RiskEngine(), market=market, persist=True,
         idle_sleep=0.0 if replay_mode else 2.0,
+        require_fyers_feed=require_fyers_feed,
     )
 
     dash = None

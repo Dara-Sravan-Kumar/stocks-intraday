@@ -26,10 +26,16 @@ def main() -> None:
     ap.add_argument("--to", dest="end", default=None, help="YYYY-MM-DD (inclusive)")
     ap.add_argument("--symbols", default=None, help="comma list; default = full universe")
     ap.add_argument("--strategies", default=None, help="comma list; default = all enabled")
-    ap.add_argument("--fetch", action="store_true", help="backfill 1m history first")
-    ap.add_argument("--fetch-dhan", action="store_true", help="backfill via Dhan instead of yfinance")
+    ap.add_argument("--fetch", action="store_true",
+                    help="backfill 1m history first — from Fyers /history (the "
+                         "authorized backtest source; fails loud if unavailable)")
+    ap.add_argument("--fetch-dhan", action="store_true",
+                    help="backfill via Dhan instead of Fyers (needs a data subscription)")
+    ap.add_argument("--fetch-yf", action="store_true",
+                    help="DEV ONLY: backfill via yfinance instead of Fyers "
+                         "(≤7 days per request, ~30-day lookback)")
     ap.add_argument("--fetch-fyers", action="store_true",
-                    help="backfill via Fyers (free, months of 1m history)")
+                    help="alias for --fetch (Fyers is the default backtest source)")
     ap.add_argument("--interval", type=int, default=None, metavar="MIN",
                     help="strategy bar interval in minutes (default: config, 5)")
     ap.add_argument("--persist", action="store_true",
@@ -55,17 +61,27 @@ def main() -> None:
                   f"[bold]Strategies:[/bold] {', '.join(s.name for s in strategies)} | "
                   f"[bold]{config.STRATEGY_INTERVAL_MIN}m bars[/bold] | {start} → {end}")
 
-    if args.fetch or args.fetch_dhan or args.fetch_fyers:
-        console.print("Backfilling 1m history…")
+    if args.fetch or args.fetch_dhan or args.fetch_fyers or args.fetch_yf:
         all_syms = symbols + list(config.INDEX_SYMBOLS)
-        if args.fetch_fyers:
-            n = history.fetch_1m_fyers(all_syms, start, end)
-        elif args.fetch_dhan:
+        if args.fetch_dhan:
+            console.print("Backfilling 1m history from Dhan…")
             instr = instruments.load_instruments()
             ids = {s: (instr[s].dhan_security_id or "") for s in symbols if s in instr}
             n = history.fetch_1m_dhan(ids, start, end)
-        else:
+        elif args.fetch_yf:
+            console.print("[yellow]Backfilling 1m history from yfinance (DEV)…[/yellow]")
             n = history.fetch_1m_yfinance(all_syms, start, end)
+        else:
+            # Default (and --fetch / --fetch-fyers): the authorized Fyers source.
+            console.print("Backfilling 1m history from Fyers /history…")
+            try:
+                n = history.fetch_1m_fyers(all_syms, start, end)
+            except history.FyersHistoryUnavailable as exc:
+                console.print(f"[red]Fyers history unavailable:[/red] {exc}")
+                console.print("[red]Aborting — not falling back to another source. "
+                              "Log in (python -m bot.fyers_auth) or pass --fetch-yf "
+                              "for a dev-only yfinance backfill.[/red]")
+                return
         console.print(f"stored {n:,} bars; dates in cache: {', '.join(db.bar_dates()[-25:])}")
 
     result, summary = run_and_save(start=start, end=end, symbols=symbols,

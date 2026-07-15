@@ -1,29 +1,33 @@
 """Fyers token management.
 
-One-time interactive login (auth-code flow) caches an access token (valid ~1
-day) plus a refresh token (valid ~15 days, rotates on use). Each morning the
-bot renews the access token automatically via the refresh token + PIN — no
-browser needed until the refresh token itself expires.
+A one-time interactive login (auth-code flow) caches an access token that is
+valid for the trading day only. Fyers has DISABLED programmatic refresh to
+comply with SEBI intraday-2FA rules — the validate-refresh-token endpoint now
+answers HTTP 400 / code -16 ("Refresh token API is currently disabled..."), so
+there is NO auto-renew. A fresh interactive login is required every trading day.
 
 CLI:
-  python -m bot.fyers_auth          # interactive login (run once / when refresh expires)
-  python -m bot.fyers_auth --check  # show token status / attempt refresh
+  python -m bot.fyers_auth          # interactive login (run once each morning)
+  python -m bot.fyers_auth --check  # show token status (no auto-refresh)
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-from datetime import datetime
-
-import requests
 
 import config
-from bot import clock
+from bot import alerts, clock
 
 log = logging.getLogger(__name__)
 
-REFRESH_URL = "https://api-t1.fyers.in/api/v3/validate-refresh-token"
+# Fyers permanently disabled programmatic token renewal to comply with SEBI
+# intraday-2FA rules: POST validate-refresh-token now returns HTTP 400 / code
+# -16. Renewal without a fresh interactive login is impossible.
+REFRESH_DISABLED_CODE = -16
+REFRESH_DISABLED_MESSAGE = (
+    "Refresh token API is currently disabled to comply with SEBI regulations "
+    "(code -16) — run a fresh login: python -m bot.fyers_auth"
+)
 
 
 def _load_tokens() -> dict:
@@ -85,46 +89,40 @@ def login_interactive() -> bool:
     return True
 
 
-def refresh() -> str | None:
-    """Renew the access token via the refresh token + PIN. Returns new token or None."""
-    s = config.fyers_settings()
-    tokens = _load_tokens()
-    if not (tokens.get("refresh_token") and s["pin"] and s["app_id"] and s["secret_id"]):
-        return None
-    app_id_hash = hashlib.sha256(
-        f"{s['app_id']}:{s['secret_id']}".encode()
-    ).hexdigest()
-    try:
-        resp = requests.post(REFRESH_URL, json={
-            "grant_type": "refresh_token",
-            "appIdHash": app_id_hash,
-            "refresh_token": tokens["refresh_token"],
-            "pin": s["pin"],
-        }, timeout=15)
-        data = resp.json()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("fyers token refresh failed: %s", exc)
-        return None
-    if data.get("s") != "ok" or "access_token" not in data:
-        log.warning("fyers token refresh rejected: %s", data)
-        return None
-    tokens["access_token"] = data["access_token"]
-    # refresh tokens rotate; keep the new one when provided
-    if data.get("refresh_token"):
-        tokens["refresh_token"] = data["refresh_token"]
-    _save_tokens(tokens)
-    log.info("fyers access token renewed")
-    return tokens["access_token"]
+def refresh() -> None:
+    """Programmatic token renewal is impossible — always returns None.
+
+    Fyers disabled the refresh-token endpoint (validate-refresh-token) to comply
+    with SEBI intraday-2FA rules; it now answers HTTP 400 with code -16
+    ("Refresh token API is currently disabled..."). This is a deliberate,
+    network-free tombstone so callers fail fast and clearly instead of hammering
+    a dead endpoint. The only way to renew is a fresh interactive login
+    (``python -m bot.fyers_auth``).
+    """
+    log.warning("fyers token refresh unavailable (code %d): %s",
+                REFRESH_DISABLED_CODE, REFRESH_DISABLED_MESSAGE)
+    return None
 
 
 def ensure_access_token() -> str | None:
-    """Valid-today access token, renewing via refresh token if stale."""
+    """Today's access token, or None when there is no fresh login.
+
+    A token that is missing OR was stamped on an earlier day is useless: Fyers
+    cannot refresh it programmatically (see refresh()), and handing a stale
+    token to the websocket only yields a cryptic auth failure. So a not-today
+    token is treated as MISSING — we return None and alert, prompting the
+    morning interactive login.
+    """
     tokens = _load_tokens()
     saved = tokens.get("saved_at", "")
     today = clock.now_ist().date().isoformat()
     if tokens.get("access_token") and saved[:10] == today:
         return tokens["access_token"]
-    return refresh() or (tokens.get("access_token") or None)
+    if tokens.get("access_token"):
+        log.warning("fyers access token is stale (saved %s, today %s) — treating as missing",
+                    saved[:10] or "never", today)
+    alerts.send("No fresh Fyers login today — run `python -m bot.fyers_auth`")
+    return None
 
 
 def ws_token() -> str | None:

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import config
-from bot import clock, db
+from bot import alerts, clock, db
 from bot.bars import Bar
 from bot.execution import Broker, ClosedTrade, Position
 from bot.feeds import Feed
@@ -30,6 +30,10 @@ from bot.strategies import Signal, Strategy
 log = logging.getLogger(__name__)
 
 INDEX_NAMES = set(config.INDEX_SYMBOLS)
+
+# How often to re-nudge the operator on Discord while the paper book stays
+# frozen (no real Fyers feed). Mirrors the MCX sibling's 60-min throttle.
+FREEZE_REMINDER_MINUTES = 60
 
 
 @dataclass
@@ -44,6 +48,8 @@ class Engine:
                  strategies: list[Strategy], risk: RiskEngine,
                  market: MarketState, persist: bool = True,
                  idle_sleep: float = 1.0,
+                 require_fyers_feed: bool = False,
+                 freeze_reminder_minutes: int = FREEZE_REMINDER_MINUTES,
                  on_event=None):
         self.mode = mode
         self.feed = feed
@@ -53,6 +59,17 @@ class Engine:
         self.market = market
         self.persist = persist
         self.idle_sleep = idle_sleep
+        # Production paper policy (matches the MCX bot): the paper book may only
+        # be OPENED / CLOSED / MARKED on the real Fyers feed. When True and the
+        # feed is a yfinance fallback/degrade (or any non-Fyers source), the book
+        # is FROZEN — we keep scanning/logging/alerting but touch nothing. Left
+        # False for backtests/replays and the intentional --feed yf dev run.
+        self.require_fyers_feed = require_fyers_feed
+        # Re-nudge the operator (Discord) roughly this often while frozen. The
+        # timer runs on engine time (bar-driven `self.now`, wall clock as a
+        # fallback) so it's deterministic in tests. None => never reminded yet.
+        self.freeze_reminder_minutes = freeze_reminder_minutes
+        self._last_freeze_alert: datetime | None = None
         self.on_event = on_event or (lambda kind, msg: None)
 
         self.now: datetime | None = None
@@ -116,6 +133,14 @@ class Engine:
         self.now = max(b.ts for b in batch) + timedelta(minutes=1)  # bar end
         phase = clock.phase(self.now)
 
+        # Book policy: on a non-Fyers/degraded feed the book is frozen — we still
+        # advance indicators (scanning) but never open, close, or mark positions.
+        frozen = self._book_frozen()
+        if frozen:
+            self._announce_freeze()
+        else:
+            self._reset_freeze_reminder()
+
         completed_5m: list[str] = []
         for bar in batch:
             if bar.symbol in INDEX_NAMES:
@@ -128,13 +153,17 @@ class Engine:
             self.bars_processed += 1
             self.marks[bar.symbol] = bar.close
 
-            self._fill_pending(bar, phase)
-            self._check_price_exits(bar)
+            if not frozen:
+                self._fill_pending(bar, phase)
+                self._check_price_exits(bar)
             if st.on_bar_1m(bar) is not None:
                 completed_5m.append(bar.symbol)
-            self._manage_positions(bar)
+            if not frozen:
+                self._manage_positions(bar)
 
-        if phase == clock.SQUAREOFF and not self._squared_off:
+        if frozen:
+            pass  # book frozen: no square-off, no daily-loss close on stale marks
+        elif phase == clock.SQUAREOFF and not self._squared_off:
             self._square_off_all("SQUAREOFF")
         elif not self.day.halted:
             equity = self.broker.equity(self.marks)
@@ -164,8 +193,63 @@ class Engine:
 
     # ------------------------------------------------------------- entries
 
+    def _feed_degraded(self) -> bool:
+        """True when a real-time feed fell back mid-session (source contains
+        'degraded'). Its data is laggy, so NEW entries are paused while degraded
+        — open positions are still managed and closed. An intentional --feed yf
+        run (source 'yfinance', without 'degraded') is NOT paused."""
+        return "degraded" in self.feed.source_name.lower()
+
+    def _book_frozen(self) -> bool:
+        """The paper book is FROZEN unless the data source is the real Fyers
+        feed. Under require_fyers_feed (production paper runs), a yfinance
+        fallback/degrade — or any non-Fyers source — means prices aren't
+        trustworthy, so NO position is opened, closed, or marked: we scan, log,
+        and alert only. Backtests/replays and the intentional --feed yf dev run
+        set require_fyers_feed=False and are never frozen."""
+        if not self.require_fyers_feed:
+            return False
+        src = self.feed.source_name.lower()
+        return (not src.startswith("fyers-ws")) or "degraded" in src or "aborted" in src
+
+    def _announce_freeze(self) -> None:
+        """Nudge the operator that the book is FROZEN — immediately on entry, then
+        re-send roughly every `freeze_reminder_minutes` while it stays frozen, so
+        the daily-Fyers-login reminder keeps arriving until they act. Timed on
+        engine time (self.now, wall clock as a fallback) for deterministic tests."""
+        now = self.now or clock.now_ist()
+        last = self._last_freeze_alert
+        if last is not None and (now - last) < timedelta(minutes=self.freeze_reminder_minutes):
+            return
+        self._last_freeze_alert = now
+        first = last is None
+        self._event("freeze", f"book FROZEN — no real Fyers feed "
+                              f"(feed: {self.feed.source_name}); "
+                              + ("scanning/logging only" if first
+                                 else "still frozen — hourly login reminder"))
+        msg = ("🧊 Fyers login missing / feed degraded — paper book is FROZEN, "
+               f"no trades booked (feed: {self.feed.source_name}). Run the daily "
+               "Fyers login (one login covers all 3 bots; deadline before 08:45).")
+        try:
+            alerts.send(msg)
+        except Exception:  # noqa: BLE001 — an alert failure must never kill the loop
+            pass
+
+    def _reset_freeze_reminder(self) -> None:
+        """Feed recovered — clear the timer so a later degrade re-alerts promptly."""
+        self._last_freeze_alert = None
+
     def _collect_signals(self, symbols: list[str]) -> None:
         if not clock.entries_allowed(self.now):
+            return
+        if self._book_frozen():
+            self._announce_freeze()
+            self._log_skip(None, None,
+                           "book frozen — no real Fyers feed; new entries paused")
+            return
+        if self._feed_degraded():
+            self._log_skip(None, None,
+                           "feed degraded to yfinance fallback — new entries paused")
             return
         # Phase 1: gather every signal this minute across symbols/strategies.
         candidates: list[tuple[float, Signal]] = []   # (rvol_score, signal)
@@ -229,6 +313,12 @@ class Engine:
                                   f"(qty {res.qty})")
 
     def _fill_pending(self, bar: Bar, phase: str) -> None:
+        if self._book_frozen():
+            for p in [p for p in self.pending if p.signal.symbol == bar.symbol]:
+                self.pending.remove(p)
+                self._log_skip(p.signal.strategy, bar.symbol,
+                               "book frozen — no real Fyers feed; entry not opened")
+            return
         mine = [p for p in self.pending if p.signal.symbol == bar.symbol]
         for p in mine:
             self.pending.remove(p)
@@ -300,6 +390,12 @@ class Engine:
                                    updated_at=bar.ts.isoformat())
 
     def _close(self, pos: Position, ref_price: float, ts: datetime, reason: str) -> None:
+        if self._book_frozen():
+            # No trustworthy price: leave the position OPEN rather than close it
+            # on a laggy/wrong fallback mark. A crashed/left-open position is
+            # reconciled by abandon_stale_positions on the next real run.
+            self._announce_freeze()
+            return
         trade = self.broker.close_position(pos, ref_price, ts, reason)
         self.n_trades += 1
         self.closed_trades.append(trade)
@@ -316,7 +412,7 @@ class Engine:
                 gross_pnl=trade.gross_pnl, costs=trade.costs,
                 net_pnl=trade.net_pnl, r_multiple=trade.r_multiple,
                 planned_stop=pos.planned_stop, planned_target=pos.target_price,
-                exit_reason=reason,
+                exit_reason=reason, feed_source=self.feed.source_name,
             )
         emoji = "+" if trade.net_pnl >= 0 else "-"
         self._event("exit", f"{pos.strategy} {pos.side} {pos.symbol} closed ({reason}) "
@@ -341,6 +437,8 @@ class Engine:
     def _mark_equity(self) -> None:
         if not self.persist or self.now is None:
             return
+        if self._book_frozen():
+            return  # don't mark the book on an untrustworthy (non-Fyers) feed
         eq = self.broker.equity(self.marks)
         db.log_equity(
             self.mode, self.now.isoformat(), eq,
@@ -390,7 +488,7 @@ class Engine:
             pass
 
     def _finalize(self) -> None:
-        if self.broker.positions:
+        if self.broker.positions and not self._book_frozen():
             self._square_off_all("SQUAREOFF")
         self.feed.stop()
         if self.persist and self.run_id:

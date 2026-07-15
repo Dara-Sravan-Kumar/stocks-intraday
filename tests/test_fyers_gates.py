@@ -92,3 +92,36 @@ def test_fyers_auth_token_freshness(monkeypatch, tmp_path):
     # token saved today -> returned without refresh
     fyers_auth._save_tokens({"access_token": "tok123", "refresh_token": "r"})
     assert fyers_auth.ensure_access_token() == "tok123"
+
+
+def test_refresh_is_permanently_disabled_no_network(monkeypatch):
+    """Fyers disabled programmatic refresh (SEBI, code -16): refresh() must make
+    NO network call and always return None."""
+    import requests
+
+    def boom(*a, **k):  # any HTTP call here is a bug
+        raise AssertionError("refresh() must not hit the network")
+
+    monkeypatch.setattr(requests, "post", boom)
+    assert fyers_auth.REFRESH_DISABLED_CODE == -16
+    assert "-16" in fyers_auth.REFRESH_DISABLED_MESSAGE
+    assert fyers_auth.refresh() is None
+
+
+def test_stale_token_treated_as_missing_and_alerts(monkeypatch, tmp_path):
+    """A token stamped on a previous day is useless (no refresh) — it must be
+    treated as MISSING (None) and raise an explicit alert."""
+    tokens_file = tmp_path / "tokens.json"
+    tokens_file.write_text(
+        '{"access_token": "yesterday-tok", "refresh_token": "r", '
+        '"saved_at": "2020-01-01T09:00:00"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "FYERS_TOKENS_FILE", tokens_file)
+    monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+
+    sent: list[str] = []
+    monkeypatch.setattr(fyers_auth.alerts, "send", lambda msg: sent.append(msg) or True)
+
+    assert fyers_auth.ensure_access_token() is None
+    assert sent and "fyers" in sent[0].lower() and "login" in sent[0].lower()

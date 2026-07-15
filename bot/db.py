@@ -161,6 +161,15 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_specs_channel_status
         ON discovered_specs (channel, status);
     """,
+    # 004 — feed provenance on trades. A trade booked while the real-time feed
+    # had degraded to (or was intentionally) the yfinance fallback must be
+    # excludable from the promotion track record, which is judged on the
+    # production Fyers feed. NULL = legacy/unknown provenance, treated as NOT a
+    # fallback so historical trades stay counted.
+    """
+    ALTER TABLE trades ADD COLUMN feed_source TEXT;
+    CREATE INDEX IF NOT EXISTS idx_trades_feed_source ON trades (feed_source);
+    """,
 ]
 
 _local = threading.local()
@@ -295,13 +304,14 @@ def open_positions(mode: str) -> list[sqlite3.Row]:
 
 def record_trade(**kw) -> int:
     kw.setdefault("variant_key", kw.get("strategy"))
+    kw.setdefault("feed_source", None)
     cur = connect().execute(
         "INSERT INTO trades (run_id, mode, strategy, variant_key, symbol, side, qty, entry_ts, "
         "entry_price, exit_ts, exit_price, gross_pnl, costs, net_pnl, r_multiple, planned_stop, "
-        "planned_target, exit_reason) "
+        "planned_target, exit_reason, feed_source) "
         "VALUES (:run_id, :mode, :strategy, :variant_key, :symbol, :side, :qty, :entry_ts, "
         ":entry_price, :exit_ts, :exit_price, :gross_pnl, :costs, :net_pnl, :r_multiple, "
-        ":planned_stop, :planned_target, :exit_reason)",
+        ":planned_stop, :planned_target, :exit_reason, :feed_source)",
         kw,
     )
     connect().commit()

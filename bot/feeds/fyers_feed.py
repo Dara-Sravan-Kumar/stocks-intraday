@@ -28,8 +28,12 @@ def fyers_symbol(symbol: str) -> str:
 
 
 class FyersFeed(Feed):
-    def __init__(self, symbols: list[str]):
+    def __init__(self, symbols: list[str], allow_degrade: bool = True):
+        # allow_degrade=False (options / live) means there is no acceptable
+        # yfinance substitute — a feed failure aborts the session rather than
+        # silently trading on wrong/missing data.
         self.symbols = symbols
+        self._allow_degrade = allow_degrade
         self._fy_to_symbol = {fyers_symbol(s): s
                               for s in symbols + list(config.INDEX_SYMBOLS)}
         self._aggs = {s: TickAggregator(s) for s in self._fy_to_symbol.values()}
@@ -37,11 +41,21 @@ class FyersFeed(Feed):
         self._stop = threading.Event()
         self._errors = 0
         self._fallback: YfFeed | None = None
+        self._failed = False
         self._socket = None
 
     @property
     def source_name(self) -> str:
-        return "yfinance (degraded from fyers)" if self._fallback else "fyers-ws"
+        if self._fallback:
+            return "yfinance (degraded from fyers)"
+        if self._failed:
+            return "fyers-ws (aborted: feed failure)"
+        return "fyers-ws"
+
+    @property
+    def exhausted(self) -> bool:
+        # A fatal failure with no fallback ends the session cleanly.
+        return self._failed
 
     # ------------------------------------------------------------- websocket
 
@@ -94,10 +108,18 @@ class FyersFeed(Feed):
             pass
 
     def _degrade(self, reason: str) -> None:
-        if self._fallback is None:
-            log.error("FYERS FEED DEGRADED -> yfinance: %s", reason)
-            alerts.send(f"⚠️ Fyers feed degraded to yfinance: {reason}")
-            self._fallback = YfFeed(self.symbols)
+        if self._fallback is not None or self._failed:
+            return
+        if not self._allow_degrade:
+            # options / live: no yfinance equivalent — abort instead of pretend.
+            self._failed = True
+            log.error("FYERS FEED FAILED (fallback disabled) -> aborting session: %s", reason)
+            alerts.send("🛑 Fyers feed failed and yfinance fallback is disabled "
+                        f"(options/live) — aborting session: {reason}")
+            return
+        log.error("FYERS FEED DEGRADED -> yfinance: %s", reason)
+        alerts.send(f"⚠️ Fyers feed degraded to yfinance: {reason}")
+        self._fallback = YfFeed(self.symbols)
 
     # ------------------------------------------------------------------ poll
 

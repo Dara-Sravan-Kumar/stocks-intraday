@@ -11,6 +11,15 @@ import config
 from bot import db
 
 
+def _is_fallback_feed(feed_source: str | None) -> bool:
+    """A trade booked on the yfinance fallback — an intentional --feed yf run OR
+    a mid-session degrade from Fyers — is excluded from the promotion track
+    record: promotion is judged on the production Fyers feed. NULL/'' means
+    legacy trades of unknown provenance, which stay counted."""
+    s = (feed_source or "").lower()
+    return "yfinance" in s or "degraded" in s
+
+
 def _trade_stats(trades: list) -> dict:
     wins = [t["net_pnl"] for t in trades if t["net_pnl"] > 0]
     losses = [t["net_pnl"] for t in trades if t["net_pnl"] <= 0]
@@ -68,7 +77,8 @@ def promotion_readiness(console: Console | None = None,
     console = console or Console()
     crit = config.PROMOTION_CRITERIA
     since = (date.today() - timedelta(days=crit["window_sessions"] * 2)).isoformat()
-    trades = db.trades_for(mode, since_date=since)
+    trades = [t for t in db.trades_for(mode, since_date=since)
+              if not _is_fallback_feed(t["feed_source"])]
     by_strategy: dict[str, list] = defaultdict(list)
     for t in trades:
         by_strategy[t["strategy"]].append(t)

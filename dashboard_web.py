@@ -1,7 +1,23 @@
-"""Streamlit dashboard over data/bot.db — summary, today's picks, trades, ledger.
+"""Read-only web dashboard for the intraday NSE-equities bot — mirrors the MCX
+bot's layout: TWO top-level views in the sidebar, each with its own neat tab bar
+over the same SQLite state (data/bot.db).
 
-Run:  streamlit run dashboard_web.py    (http://localhost:8503)
-Read-only: it never writes to the database.
+  🟢 Live  — REAL-money trading readiness & broker gate. Live routing is OFF
+             until a strategy graduates off the paper book. Tabs: Readiness,
+             Broker & Gate.
+  📝 Paper — the paper book (equity PAPER + index-options PAPER-OPT). Tabs:
+               • Summary    — realized & unrealized P&L headline + engine status.
+               • Open Book  — every open position with margin, current price, P&L.
+               • Closed Book— realized trades + per-strategy/-symbol attribution.
+               • Fleet      — every strategy variant (classic + discovered + bred).
+               • History    — equity curve, daily P&L, run log.
+               • Backtest   — replay cached 1m bars through the engine on demand.
+               • Feed & Status — engine heartbeat, feed provenance, skips.
+
+Run:  .venv\\Scripts\\python.exe -m streamlit run dashboard_web.py   (http://localhost:8503)
+
+Read-only: opens the DB in mode=ro so it can never write to or lock the file the
+live engine is using — purely a viewer. Figures are "as of the last mark".
 """
 from __future__ import annotations
 
@@ -38,7 +54,7 @@ EQUITY_BLUE = "#2a78d6"
 START_CASH = {
     "PAPER": config.PAPER_STARTING_CASH,
     "PAPER-OPT": config.OPTIONS["paper_capital"],
-    "LIVE": config.PAPER_STARTING_CASH,
+    "LIVE": config.LIVE_CAPITAL,
     "REPLAY": config.PAPER_STARTING_CASH,
     "BACKTEST": config.PAPER_STARTING_CASH,
 }
@@ -46,7 +62,14 @@ START_CASH = {
 
 @st.cache_resource
 def get_conn():
-    conn = sqlite3.connect(str(config.DB_PATH), check_same_thread=False)
+    """Read-only connection — never writes to or locks the live DB."""
+    try:
+        conn = sqlite3.connect(f"file:{config.DB_PATH}?mode=ro", uri=True,
+                               check_same_thread=False)
+    except sqlite3.OperationalError:
+        # DB not created yet (no run has happened) — a normal connection lets the
+        # viewer render empty rather than crash. Still read-only in practice.
+        conn = sqlite3.connect(str(config.DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -62,6 +85,16 @@ def inr(x: float) -> str:
     return f"₹{x:,.0f}"
 
 
+def heartbeat() -> dict | None:
+    raw = q("SELECT value FROM kv WHERE key='engine_heartbeat'")
+    if raw.empty:
+        return None
+    try:
+        return json.loads(raw.iloc[0, 0])
+    except Exception:
+        return None
+
+
 def latest_marks(symbols: list[str]) -> dict[str, float]:
     if not symbols:
         return {}
@@ -72,32 +105,41 @@ def latest_marks(symbols: list[str]) -> dict[str, float]:
     return dict(zip(df["symbol"], df["close"])) if not df.empty else {}
 
 
-# ------------------------------------------------------- fixed sidebar nav
-# Only two real trading accounts. Replay/backtest are testing output and live
-# under the "Runs & Backtests" view, not here.
+# ------------------------------------------------------- sidebar nav (2 views)
+# Mirrors the MCX dashboard: a two-option sidebar radio, each view owning its
+# own tab bar. Paper spans both paper books (equity + index-options).
 
 MODE_OPTIONS = {
-    "📝 Paper": ["PAPER", "PAPER-OPT"],   # equity book + index-options book
-    "🔴 Live": ["LIVE"],
+    "🟢 Live": ["LIVE"],
+    "📝 Paper": ["PAPER", "PAPER-OPT"],
 }
-PAGES = ["📊 Summary", "🎯 Today's Picks", "🧾 All Trades", "📒 Ledger",
-         "📅 History", "🧬 Fleet", "🧪 Runs & Backtests", "🚫 Skips"]
 
-head_l, head_r = st.columns([3, 2])
-head_l.title("📈 Intraday Bot — Nifty 50 + Bank Nifty")
-choice = head_r.radio(
-    "Trading mode", list(MODE_OPTIONS), index=0, horizontal=True,
-    help="Paper = simulated book · Live = real orders. "
-         "Replays and backtests are inspected under the Runs & Backtests view.")
-db_modes = MODE_OPTIONS[choice]           # underlying DB modes this covers
-multi = len(db_modes) > 1                 # spans >1 book → show the mode column
+st.sidebar.title("📈 Intraday Bot")
+st.sidebar.caption("Nifty 50 + Bank Nifty · live-tick paper trading")
+view = st.sidebar.radio("View", list(MODE_OPTIONS), index=1,
+                        label_visibility="collapsed")
+if st.sidebar.button("🔄 Refresh data"):
+    st.rerun()
+
+db_modes = MODE_OPTIONS[view]              # underlying DB modes this view covers
+multi = len(db_modes) > 1                  # spans >1 book → show the mode column
 start_cash = sum(START_CASH.get(m, 0.0) for m in db_modes)
-head_r.caption("Paper equity = starting capital + closed-trade ledger. "
-               "The ledger is the source of truth.")
+
+_hb = heartbeat()
+if _hb:
+    beat = _hb.get("wall_ts", "")[:16]
+    st.sidebar.caption(
+        f"**Engine** {_hb.get('mode')} · phase {_hb.get('phase')}\n\n"
+        f"feed `{_hb.get('feed')}` · equity {inr(_hb.get('equity', 0))} "
+        f"({_hb.get('day_pnl', 0):+,.0f})\n\nlast beat {beat}")
+else:
+    st.sidebar.caption("No engine heartbeat — start a session with run_live.py.")
+st.sidebar.caption("Real orders "
+                   f"{'ON ⚠️' if config.LIVE_TRADING_ENABLED else 'OFF'} · read-only viewer.")
 
 
 def mode_where(col: str = "mode") -> tuple[str, tuple]:
-    """WHERE fragment + params matching the selected trading mode's books."""
+    """WHERE fragment + params matching the selected view's books."""
     ph = ",".join("?" * len(db_modes))
     return f"{col} IN ({ph})", tuple(db_modes)
 
@@ -112,7 +154,6 @@ TRADE_COLS = ["exit_ts", "mode", "strategy", "symbol", "side", "qty",
 
 
 def trade_view(df: pd.DataFrame, cols: list[str] = TRADE_COLS) -> pd.DataFrame:
-    """Column subset for display; hides the mode column in single-book views."""
     keep = [c for c in cols if c in df.columns and (multi or c != "mode")]
     return df[keep]
 
@@ -122,18 +163,9 @@ def open_positions() -> pd.DataFrame:
              "ORDER BY entry_ts", MP)
 
 
-def heartbeat() -> dict | None:
-    raw = q("SELECT value FROM kv WHERE key='engine_heartbeat'")
-    if raw.empty:
-        return None
-    try:
-        return json.loads(raw.iloc[0, 0])
-    except Exception:
-        return None
-
-
 def position_rows(pos: pd.DataFrame, marks: dict[str, float]) -> tuple[list, float]:
-    """Detailed open-position rows (risk, reward, distances) + total unrealized."""
+    """Detailed open-position rows (entry, current price, current P&L, margin,
+    risk, distances) + total unrealized."""
     unrealized, rows = 0.0, []
     for _, p in pos.iterrows():
         ltp = marks.get(p["symbol"], p["entry_price"])
@@ -145,9 +177,9 @@ def position_rows(pos: pd.DataFrame, marks: dict[str, float]) -> tuple[list, flo
         rows.append({
             "Mode": p["mode"], "Strategy": p["strategy"], "Symbol": p["symbol"],
             "Side": p["side"], "Qty": int(p["qty"]), "Entry": p["entry_price"],
-            "LTP": ltp, "Unrealized ₹": round(upnl),
-            "Stop": p["stop_price"], "Target": tgt,
-            "Risk ₹": round(risk),
+            "Current": round(ltp, 2), "Current P&L ₹": round(upnl),
+            "Margin ₹": round(p["margin_used"]),
+            "Stop": p["stop_price"], "Target": tgt, "Risk ₹": round(risk),
             "To stop %": round((ltp - p["stop_price"]) / ltp * 100 * sign, 2)
                          if ltp else None,
             "To target %": round((tgt - ltp) / ltp * 100 * sign, 2)
@@ -160,9 +192,11 @@ def position_rows(pos: pd.DataFrame, marks: dict[str, float]) -> tuple[list, flo
     return rows, unrealized
 
 
-# -------------------------------------------------------------- Summary tab
+# ===========================================================================
+# 📝 PAPER — Summary / Open Book / Closed Book / Fleet / History / Backtest
+# ===========================================================================
 
-def render_engine_status():
+def render_engine_status() -> None:
     hb = heartbeat()
     if hb is None:
         st.info("No engine heartbeat yet — the status panel activates once a "
@@ -173,6 +207,11 @@ def render_engine_status():
     if hb.get("halted"):
         running += f" · ⛔ HALTED: {hb.get('halt_reason')}"
     st.markdown(f"⚙️ {running} — last beat {stale}")
+    feed = str(hb.get("feed", "")).lower()
+    if "degraded" in feed or (feed and not feed.startswith(("fyers-ws", "replay"))):
+        st.warning("🧊 Feed is not the real Fyers feed — under the Fyers-only "
+                   "policy the paper book is FROZEN (no open/close/mark) on a "
+                   "fallback/degraded feed. Scanning & logging continue.")
     cols = st.columns(4)
     cols[0].metric("Engine equity", inr(hb.get("equity", 0)))
     cols[1].metric("Day P&L", inr(hb.get("day_pnl", 0)))
@@ -182,15 +221,15 @@ def render_engine_status():
     strategies = hb.get("strategies", [])
     benched = set(hb.get("benched", []))
     chips = "  ".join(
-        f"🔴 ~~{s}~~ (benched)" if s in benched else f"🟢 {s}" for s in strategies
-    )
+        f"🔴 ~~{s}~~ (benched)" if s in benched else f"🟢 {s}" for s in strategies)
     st.markdown(f"**Running strategies:** {chips or '—'}")
 
 
-def render_summary():
+def render_summary() -> None:
     today = date.today().isoformat()
     render_engine_status()
     st.divider()
+
     pos = open_positions()
     marks = latest_marks(pos["symbol"].tolist() if not pos.empty else [])
     rows, unrealized = position_rows(pos, marks)
@@ -200,15 +239,21 @@ def render_summary():
     realized_today = trades_today["net_pnl"].sum() if not trades_today.empty else 0.0
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Equity (marked)", inr(start_cash + realized_total + unrealized))
+    c1.metric("Equity (marked)", inr(start_cash + realized_total + unrealized),
+              f"{(realized_total + unrealized) / start_cash * 100:+.2f}%"
+              if start_cash else None)
     c2.metric("Unrealized (open)", inr(unrealized))
     c3.metric("Realized today", inr(realized_today))
     c4.metric("Open positions", len(rows))
     c5.metric("Realized all-time", inr(realized_total))
+    st.caption(f"Starting capital {inr(start_cash)} · equity = starting + closed "
+               "ledger + open unrealized. The closed-trade ledger is the source "
+               "of truth.")
 
-    st.subheader("Open positions")
+    st.subheader("Open positions at a glance")
     if rows:
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        st.caption("Full margin / distances are in the **Open Book** tab.")
     else:
         st.caption("Flat — no open positions.")
 
@@ -225,81 +270,88 @@ def render_summary():
         eq["ts"] = pd.to_datetime(eq["ts"])
         st.line_chart(eq.set_index("ts")["equity"], color=EQUITY_BLUE)
 
-    if "PAPER-OPT" in db_modes:
-        chain = q("SELECT symbol, MAX(ts) AS ts, close FROM bars_1m "
-                  "WHERE symbol LIKE 'NSE:%' AND substr(ts,1,10)=? "
-                  "GROUP BY symbol ORDER BY symbol", (today,))
-        st.subheader("Option chain — latest cached premiums")
-        if chain.empty:
-            st.caption("No option ticks cached yet today.")
-        else:
-            chain.columns = ["Contract", "Last tick", "Premium"]
-            st.dataframe(chain, width="stretch", hide_index=True, height=320)
 
-
-# --------------------------------------------------------- Today's Picks tab
-
-def render_picks():
-    today = date.today().isoformat()
-    st.caption("Everything the bot picked TODAY — open positions in detail, "
-               "entries taken, and what it looked at but skipped.")
-
-    hb = heartbeat()
-    if hb:
-        benched = set(hb.get("benched", []))
-        chips = "  ".join(
-            f"🔴 ~~{s}~~ (benched)" if s in benched else f"🟢 {s}"
-            for s in hb.get("strategies", []))
-        st.markdown(f"**Strategies hunting today:** {chips or '—'}")
-
+def render_open_book() -> None:
+    st.subheader("Open Book — live positions")
+    st.caption("Every open paper position with margin blocked, entry, current "
+               "price and current unrealized P&L (marked on the latest cached tick).")
     pos = open_positions()
-    marks = latest_marks(pos["symbol"].tolist() if not pos.empty else [])
+    if pos.empty:
+        st.info("Flat — no open paper positions.")
+        return
+    marks = latest_marks(pos["symbol"].tolist())
     rows, unrealized = position_rows(pos, marks)
+    df = pd.DataFrame(rows)
+    st.dataframe(df, width="stretch", hide_index=True)
 
-    st.subheader("Active picks — open positions")
-    if rows:
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-        st.caption(f"Total unrealized: {inr(unrealized)} · risk figures use the "
-                   "planned stop; distances are signed in the trade's favor.")
-    else:
-        st.caption("No active picks — the book is flat.")
-
-    st.subheader("Entries taken today")
-    entered = trades_all[trades_all["entry_ts"].str[:10] == today] \
-        if not trades_all.empty else pd.DataFrame()
-    n_open_today = len(pos[pos["entry_ts"].str[:10] == today]) if not pos.empty else 0
-    if entered.empty and n_open_today == 0:
-        st.caption("No entries yet today.")
-    else:
-        if n_open_today:
-            st.caption(f"{n_open_today} of today's entries are still open "
-                       "(listed above); closed ones below.")
-        if not entered.empty:
-            st.dataframe(
-                trade_view(entered, ["entry_ts", "mode", "strategy", "symbol",
-                                     "side", "qty", "entry_price", "exit_price",
-                                     "net_pnl", "r_multiple", "exit_reason"]),
-                width="stretch", hide_index=True)
-
-    st.subheader("Considered but skipped today")
-    skips = q(f"SELECT ts, mode, strategy, symbol, reason FROM skips "
-              f"WHERE {MW} AND substr(ts,1,10)=? ORDER BY id DESC LIMIT 300",
-              MP + (today,))
-    if skips.empty:
-        st.caption("No skips recorded today.")
-    else:
-        top = (skips["reason"].str.split(":").str[0]
-               .value_counts().head(8).reset_index())
-        top.columns = ["Skip reason", "Count"]
-        c1, c2 = st.columns([1, 2])
-        c1.dataframe(top, width="stretch", hide_index=True)
-        c2.dataframe(skips if multi else skips.drop(columns=["mode"]),
-                     width="stretch", hide_index=True, height=300)
+    total_margin = float(pos["margin_used"].sum())
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total margin blocked", inr(total_margin))
+    m2.metric("Total current P&L", inr(unrealized))
+    m3.metric("Open positions", len(df))
+    st.caption("Distances are signed in the trade's favor; risk uses the planned stop.")
 
 
-# ------------------------------------------------------------ All Trades tab
+def render_closed_book() -> None:
+    st.subheader("Closed Book — realized trades + attribution")
+    if trades_all.empty:
+        st.info("No closed trades recorded yet in this view.")
+        return
+    t = trades_all.copy()
+    n = len(t)
+    wins = int((t["net_pnl"] > 0).sum())
+    total = float(t["net_pnl"].sum())
+    avg_win = t.loc[t["net_pnl"] > 0, "net_pnl"].mean()
+    avg_loss = t.loc[t["net_pnl"] <= 0, "net_pnl"].mean()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Closed trades", f"{n}", f"{wins / n * 100:.0f}% win" if n else None)
+    c2.metric("Total realized P&L", inr(total))
+    c3.metric("Avg win", inr(avg_win) if wins else "-")
+    c4.metric("Avg loss", inr(avg_loss) if n - wins else "-")
 
-def trade_drilldown(tr: pd.Series):
+    st.dataframe(
+        trade_view(t.sort_values("exit_ts", ascending=False),
+                   ["exit_ts", "mode", "strategy", "symbol", "side", "qty",
+                    "entry_price", "exit_price", "gross_pnl", "costs", "net_pnl",
+                    "r_multiple", "exit_reason"]),
+        width="stretch", hide_index=True, height=340)
+
+    st.subheader("Attribution — per strategy")
+    keys = ["mode", "strategy"] if multi else ["strategy"]
+    g = (t.assign(win=(t["net_pnl"] > 0).astype(int)).groupby(keys)
+         .agg(Trades=("net_pnl", "count"), Wins=("win", "sum"),
+              Gross=("gross_pnl", "sum"), Costs=("costs", "sum"),
+              Net=("net_pnl", "sum")).reset_index())
+    g["Win %"] = (g["Wins"] / g["Trades"] * 100).round(0)
+    g = g.sort_values("Net", ascending=False)
+    st.dataframe(g, width="stretch", hide_index=True)
+    st.bar_chart(g.set_index("strategy")["Net"])
+
+    st.subheader("Attribution — per symbol")
+    agg = (t.assign(win=(t["net_pnl"] > 0).astype(int)).groupby("symbol")
+           .agg(Trades=("net_pnl", "count"), Wins=("win", "sum"),
+                Net=("net_pnl", "sum")).reset_index())
+    agg["Win %"] = (agg["Wins"] / agg["Trades"] * 100).round(1)
+    agg = agg.sort_values("Net", ascending=False)
+    st.dataframe(agg[["symbol", "Trades", "Win %", "Net"]],
+                 width="stretch", hide_index=True)
+
+    st.subheader("Exit-reason breakdown")
+    reasons = (t["exit_reason"].str.split(":").str[0].value_counts()
+               .rename_axis("reason").reset_index(name="n"))
+    if not reasons.empty:
+        st.bar_chart(reasons.set_index("reason")["n"])
+
+    st.subheader("Trade drill-down")
+    ids = t.sort_values("exit_ts", ascending=False)["id"].tolist()
+    lbl = {r["id"]: (f"#{r['id']} · {r['exit_ts'][:16]} · {r['strategy']} · "
+                     f"{r['symbol']} {r['side']} · net {inr(r['net_pnl'])}")
+           for _, r in t.iterrows()}
+    sel_id = st.selectbox("Trade", ids, format_func=lambda i: lbl[i], key="cb_drill")
+    trade_drilldown(t[t["id"] == sel_id].iloc[0])
+
+
+def trade_drilldown(tr: pd.Series) -> None:
     entry_t = pd.to_datetime(tr["entry_ts"])
     exit_t = pd.to_datetime(tr["exit_ts"])
     hold_min = max(0, int((exit_t - entry_t).total_seconds() // 60))
@@ -319,289 +371,143 @@ def trade_drilldown(tr: pd.Series):
         st.caption("No 1-minute bars cached for this symbol/day — no chart.")
         return
     bars["ts"] = pd.to_datetime(bars["ts"])
-
     pnl_color = GOOD if tr["net_pnl"] >= 0 else BAD
     price = (alt.Chart(bars).mark_line(strokeWidth=2, color=EQUITY_BLUE)
              .encode(x=alt.X("ts:T", title=None),
-                     y=alt.Y("close:Q", title="Price ₹",
-                             scale=alt.Scale(zero=False))))
-
-    hover = alt.selection_point(fields=["ts"], nearest=True,
-                                on="mouseover", empty=False)
-    probe = (alt.Chart(bars).mark_point(opacity=0)
-             .encode(x="ts:T",
-                     tooltip=[alt.Tooltip("ts:T", title="Time", format="%H:%M"),
-                              alt.Tooltip("close:Q", title="Price", format=",.2f")])
-             .add_params(hover))
-    crosshair = (alt.Chart(bars).mark_rule(color="#8a8a8a", strokeWidth=1)
-                 .encode(x="ts:T").transform_filter(hover))
-
+                     y=alt.Y("close:Q", title="Price ₹", scale=alt.Scale(zero=False))))
     marker_df = pd.DataFrame([
-        {"ts": entry_t, "price": tr["entry_price"], "label": "Entry",
-         "color": EQUITY_BLUE},
-        {"ts": exit_t, "price": tr["exit_price"], "label": "Exit",
-         "color": pnl_color},
+        {"ts": entry_t, "price": tr["entry_price"], "label": "Entry", "color": EQUITY_BLUE},
+        {"ts": exit_t, "price": tr["exit_price"], "label": "Exit", "color": pnl_color},
     ])
     points = (alt.Chart(marker_df)
               .mark_point(size=140, filled=True, stroke="white", strokeWidth=2)
-              .encode(x="ts:T", y="price:Q",
-                      color=alt.Color("color:N", scale=None),
+              .encode(x="ts:T", y="price:Q", color=alt.Color("color:N", scale=None),
                       tooltip=[alt.Tooltip("label:N", title="Event"),
                                alt.Tooltip("price:Q", title="Price", format=",.2f")]))
-    point_labels = (alt.Chart(marker_df)
-                    .mark_text(dy=-14, fontWeight="bold")
-                    .encode(x="ts:T", y="price:Q", text="label:N"))
-
+    labels = (alt.Chart(marker_df).mark_text(dy=-14, fontWeight="bold")
+              .encode(x="ts:T", y="price:Q", text="label:N"))
+    layers = [price, points, labels]
     levels = []
     if pd.notna(tr.get("planned_stop")):
         levels.append({"price": tr["planned_stop"], "label": "Stop", "color": BAD})
     if pd.notna(tr.get("planned_target")):
-        levels.append({"price": tr["planned_target"], "label": "Target",
-                       "color": GOOD})
-    layers = [price, probe, crosshair, points, point_labels]
+        levels.append({"price": tr["planned_target"], "label": "Target", "color": GOOD})
     if levels:
         lv = pd.DataFrame(levels)
-        layers.append(alt.Chart(lv)
-                      .mark_rule(strokeDash=[5, 4], strokeWidth=1.5)
+        layers.append(alt.Chart(lv).mark_rule(strokeDash=[5, 4], strokeWidth=1.5)
                       .encode(y="price:Q", color=alt.Color("color:N", scale=None)))
-        layers.append(alt.Chart(lv)
-                      .mark_text(align="left", dx=4, dy=-6)
-                      .encode(y="price:Q", text="label:N",
-                              x=alt.value(0)))
-
-    st.altair_chart(alt.layer(*layers).properties(height=380)
-                    .interactive(bind_y=False), width="stretch")
+    st.altair_chart(alt.layer(*layers).properties(height=360).interactive(bind_y=False),
+                    width="stretch")
 
 
-def render_trades():
-    if trades_all.empty:
-        st.caption("No closed trades recorded yet in this mode.")
-        return
-    t = trades_all.copy()
-    t["day"] = t["exit_ts"].str[:10]
+def render_history() -> None:
+    st.caption("Everything over time — equity curve, daily P&L, and the run log.")
+    if not trades_all.empty:
+        t = trades_all.copy()
+        t["day"] = t["exit_ts"].str[:10]
+        daily = t.groupby("day")["net_pnl"].sum().reset_index()
+        daily["equity"] = start_cash + daily["net_pnl"].cumsum()
 
-    f1, f2, f3, f4 = st.columns(4)
-    sel_strat = f1.selectbox("Strategy", ["(all)"] + sorted(t["strategy"].unique()),
-                             key="tr_strat")
-    sel_sym = f2.selectbox("Symbol", ["(all)"] + sorted(t["symbol"].unique()),
-                           key="tr_sym")
-    sel_out = f3.selectbox("Outcome", ["(all)", "Winners", "Losers"], key="tr_out")
-    days = sorted(t["day"].unique())
-    sel_range = f4.select_slider("Date range", options=days,
-                                 value=(days[0], days[-1]), key="tr_days")
+        c1, c2, c3, c4 = st.columns(4)
+        wins = (t["net_pnl"] > 0).sum()
+        gross_win = t.loc[t["net_pnl"] > 0, "net_pnl"].sum()
+        gross_loss = -t.loc[t["net_pnl"] <= 0, "net_pnl"].sum()
+        c1.metric("Net P&L (all time)", inr(realized_total))
+        c2.metric("Trades / Win rate", f"{len(t)} / {wins / len(t) * 100:.0f}%")
+        c3.metric("Profit factor", f"{gross_win / gross_loss:.2f}" if gross_loss > 0 else "∞")
+        c4.metric("Total costs paid", inr(t["costs"].sum()))
 
-    view = t[(t["day"] >= sel_range[0]) & (t["day"] <= sel_range[1])]
-    if sel_strat != "(all)":
-        view = view[view["strategy"] == sel_strat]
-    if sel_sym != "(all)":
-        view = view[view["symbol"] == sel_sym]
-    if sel_out == "Winners":
-        view = view[view["net_pnl"] > 0]
-    elif sel_out == "Losers":
-        view = view[view["net_pnl"] <= 0]
+        st.subheader("Equity curve (closed-trade ledger)")
+        st.line_chart(daily.set_index("day")["equity"], color=EQUITY_BLUE)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Trades", len(view))
-    c2.metric("Gross", inr(view["gross_pnl"].sum()))
-    c3.metric("Costs", inr(view["costs"].sum()))
-    c4.metric("Net", inr(view["net_pnl"].sum()))
+        st.subheader("Daily net P&L")
+        dd = daily.set_index("day")[["net_pnl"]]
+        dd["profit"] = dd["net_pnl"].clip(lower=0)
+        dd["loss"] = dd["net_pnl"].clip(upper=0)
+        st.bar_chart(dd[["profit", "loss"]], color=[GOOD, BAD])
 
-    st.dataframe(trade_view(view.sort_values("exit_ts", ascending=False),
-                            ["exit_ts", "mode", "strategy", "symbol", "side",
-                             "qty", "entry_ts", "entry_price", "exit_price",
-                             "gross_pnl", "costs", "net_pnl", "r_multiple",
-                             "planned_stop", "planned_target", "exit_reason"]),
-                 width="stretch", hide_index=True, height=360)
+        st.subheader("Cumulative net by strategy")
+        pivot = (t.pivot_table(index="day", columns="strategy", values="net_pnl",
+                               aggfunc="sum").fillna(0).cumsum())
+        colors = [STRATEGY_COLORS.get(c, "#52514e") for c in pivot.columns]
+        st.line_chart(pivot, color=colors)
+    else:
+        st.caption("No closed trades yet — the equity curve appears as trades close.")
 
-    st.subheader("Trade drill-down")
-    if view.empty:
-        st.caption("No trades match the filters.")
-        return
-    ids = view.sort_values("exit_ts", ascending=False)["id"].tolist()
-    lbl = {r["id"]: (f"#{r['id']} · {r['exit_ts'][:16]} · {r['strategy']} · "
-                     f"{r['symbol']} {r['side']} · net {inr(r['net_pnl'])}")
-           for _, r in view.iterrows()}
-    sel_id = st.selectbox("Trade", ids, format_func=lambda i: lbl[i],
-                          key="tr_drill")
-    trade_drilldown(view[view["id"] == sel_id].iloc[0])
+    st.subheader("Run log")
+    runs = q(f"SELECT id, mode, session_date, feed_source, started_at, finished_at, "
+             f"bars_processed, signals, trades FROM runs WHERE {MW} "
+             "ORDER BY id DESC LIMIT 200", MP)
+    if runs.empty:
+        st.caption("No runs logged yet.")
+    else:
+        st.dataframe(runs, width="stretch", hide_index=True, height=280)
 
 
-# --------------------------------------------------------------- Ledger tab
+def render_backtest() -> None:
+    from bot.backtest import PERIODS
 
-def render_ledger():
-    if trades_all.empty:
-        st.caption("Ledger is empty in this mode.")
-        return
-    t = trades_all.sort_values("exit_ts").copy()
-    t["day"] = t["exit_ts"].str[:10]
-    # Running balance over the FULL ledger (before any filters).
-    t["balance"] = start_cash + t["net_pnl"].cumsum()
+    st.caption("Replays cached 1m bars through the real engine (bot/backtest.py). "
+               "Backfills come from Fyers /history (the authorized source; a fetch "
+               "fails loud if Fyers is unavailable rather than silently using "
+               "yfinance). Read-only — results are held in this session.")
+    with st.form("bt_form"):
+        col = st.columns(4)
+        period = col[0].selectbox("Period", list(PERIODS), index=1)
+        max_instr = col[1].number_input("Max instruments", 1, 60, 15)
+        capital = col[2].number_input("Capital ₹", 100_000, 50_000_000,
+                                      int(config.PAPER_STARTING_CASH), step=100_000)
+        seeds_only = col[3].checkbox("Seeds only", value=False,
+                                     help="backtest only the SEED_GENES library (equity)")
+        submitted = st.form_submit_button("▶️ Run backtest")
 
-    f1, f2, f3 = st.columns(3)
-    sel_strat = f1.selectbox("Strategy", ["(all)"] + sorted(t["strategy"].unique()),
-                             key="lg_strat")
-    sel_sym = f2.selectbox("Symbol", ["(all)"] + sorted(t["symbol"].unique()),
-                           key="lg_sym")
-    days = sorted(t["day"].unique())
-    sel_range = f3.select_slider("Date range", options=days,
-                                 value=(days[0], days[-1]), key="lg_days")
-    view = t[(t["day"] >= sel_range[0]) & (t["day"] <= sel_range[1])]
-    if sel_strat != "(all)":
-        view = view[view["strategy"] == sel_strat]
-    if sel_sym != "(all)":
-        view = view[view["symbol"] == sel_sym]
+    if submitted:
+        from bot.backtest import run_and_save
+        with st.spinner(f"Replaying {period}…"):
+            try:
+                _, summary = run_and_save(period=period, max_instruments=int(max_instr),
+                                          starting_cash=float(capital), seeds_only=seeds_only)
+                st.session_state["bt_last"] = {"period": period, "summary": summary,
+                                               "seeds_only": seeds_only}
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Backtest failed: {exc}")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Trades", len(view))
-    c2.metric("Gross", inr(view["gross_pnl"].sum()))
-    c3.metric("Costs", inr(view["costs"].sum()))
-    c4.metric("Net", inr(view["net_pnl"].sum()))
+    last = st.session_state.get("bt_last")
+    if last:
+        s = last["summary"]
+        if "error" in s:
+            st.warning(s["error"])
+        else:
+            st.caption(f"Last run · {last['period']}"
+                       + (" · seeds only" if last["seeds_only"] else ""))
+            m = st.columns(5)
+            m[0].metric("Sessions", s["sessions"])
+            m[1].metric("Trades", f"{s['trades']:,}")
+            m[2].metric("Net P&L", inr(s["total_net"]))
+            m[3].metric("Max DD", f"{s['max_dd_pct']:.1f}%")
+            pf = s["profit_factor"]
+            m[4].metric("Profit factor",
+                        "∞" if pf == float("inf") else (f"{pf:.2f}" if pf else "—"))
 
-    disp = trade_view(view, ["exit_ts", "mode", "strategy", "symbol", "side",
-                             "qty", "entry_price", "exit_price", "gross_pnl",
-                             "costs", "net_pnl", "r_multiple", "planned_stop",
-                             "planned_target", "exit_reason", "balance"])
-    disp = disp.rename(columns={"balance": "Balance ₹"})
-    st.dataframe(disp, width="stretch", hide_index=True, height=420)
-    st.caption("Balance ₹ is the running book balance after each trade, "
-               "computed over the whole ledger (filters don't change it).")
-
-    st.subheader("Daily ledger")
-    daily = (view.groupby("day")
-             .agg(trades=("id", "count"), gross=("gross_pnl", "sum"),
-                  costs=("costs", "sum"), net=("net_pnl", "sum"))
-             .reset_index().sort_values("day", ascending=False))
-    st.dataframe(daily, width="stretch", hide_index=True, height=240)
-
-    label = choice.split(" ", 1)[-1]
-    st.download_button(
-        "⬇ Download CSV", view.to_csv(index=False).encode(),
-        file_name=f"trades_{label}_{sel_range[0]}_{sel_range[1]}.csv",
-        mime="text/csv")
-
-
-# -------------------------------------------------------------- History tab
-
-def render_history():
-    if trades_all.empty:
-        st.caption("No closed trades recorded yet in this mode.")
-        return
-    t = trades_all.copy()
-    t["day"] = t["exit_ts"].str[:10]
-
-    daily = t.groupby("day")["net_pnl"].sum().reset_index()
-    daily["equity"] = start_cash + daily["net_pnl"].cumsum()
-
-    c1, c2, c3, c4 = st.columns(4)
-    wins = (t["net_pnl"] > 0).sum()
-    gross_win = t.loc[t["net_pnl"] > 0, "net_pnl"].sum()
-    gross_loss = -t.loc[t["net_pnl"] <= 0, "net_pnl"].sum()
-    c1.metric("Net P&L (all time)", inr(realized_total))
-    c2.metric("Trades / Win rate", f"{len(t)} / {wins / len(t) * 100:.0f}%")
-    c3.metric("Profit factor",
-              f"{gross_win / gross_loss:.2f}" if gross_loss > 0 else "∞")
-    c4.metric("Total costs paid", inr(t["costs"].sum()))
-
-    st.subheader("Equity curve (closed-trade ledger)")
-    st.line_chart(daily.set_index("day")["equity"], color=EQUITY_BLUE)
-
-    st.subheader("Daily net P&L")
-    daily_disp = daily.set_index("day")[["net_pnl"]]
-    daily_disp["profit"] = daily_disp["net_pnl"].clip(lower=0)
-    daily_disp["loss"] = daily_disp["net_pnl"].clip(upper=0)
-    st.bar_chart(daily_disp[["profit", "loss"]], color=[GOOD, BAD])
-
-    st.subheader("Cumulative net by strategy")
-    pivot = (t.pivot_table(index="day", columns="strategy", values="net_pnl",
-                           aggfunc="sum").fillna(0).cumsum())
-    colors = [STRATEGY_COLORS.get(c, "#52514e") for c in pivot.columns]
-    st.line_chart(pivot, color=colors)
-
-    st.subheader("Per-strategy summary")
-    keys = ["mode", "strategy"] if multi else ["strategy"]
-    g = t.groupby(keys).agg(
-        trades=("id", "count"),
-        win_rate=("net_pnl", lambda s: f"{(s > 0).mean() * 100:.0f}%"),
-        gross=("gross_pnl", "sum"), costs=("costs", "sum"),
-        net=("net_pnl", "sum"), avg_r=("r_multiple", "mean"),
-    ).reset_index()
-    st.dataframe(g, width="stretch", hide_index=True)
+    st.divider()
+    st.subheader("Persisted backtest / replay runs")
+    bt_runs = q("SELECT r.id, r.mode, r.session_date, r.feed_source, r.started_at, "
+                "r.bars_processed, r.trades, COALESCE(t.net, 0) AS net_pnl "
+                "FROM runs r LEFT JOIN (SELECT run_id, SUM(net_pnl) AS net FROM trades "
+                "GROUP BY run_id) t ON t.run_id = r.id "
+                "WHERE r.mode IN ('BACKTEST','REPLAY') ORDER BY r.id DESC LIMIT 200")
+    if bt_runs.empty:
+        st.caption("No persisted BACKTEST/REPLAY runs — run "
+                   "`run_backtest.py --persist` to record one.")
+    else:
+        st.dataframe(bt_runs, width="stretch", hide_index=True, height=240)
 
 
-# ------------------------------------------------------ Runs & Backtests tab
-# Independent of the Paper/Live toggle — this is the home for every run type,
-# including the replay and backtest sessions.
-
-def render_runs():
-    st.caption("Every engine run — paper, live, replay, and backtest sessions. "
-               "This is where replays and backtests are inspected. A replay "
-               "re-runs the engine bar-by-bar over cached history; a backtest "
-               "sweeps a date range at once.")
-    all_runs = q("SELECT r.id, r.mode, r.session_date, r.feed_source, "
-                 "r.started_at, r.finished_at, r.bars_processed, r.signals, "
-                 "r.trades, COALESCE(t.net, 0) AS net_pnl "
-                 "FROM runs r LEFT JOIN (SELECT run_id, SUM(net_pnl) AS net "
-                 "FROM trades GROUP BY run_id) t ON t.run_id = r.id "
-                 "ORDER BY r.id DESC LIMIT 500")
-    if all_runs.empty:
-        st.caption("No runs recorded yet.")
-        return
-
-    run_types = ["(all)"] + sorted(all_runs["mode"].unique())
-    sel_type = st.selectbox("Run type", run_types)
-    runs = all_runs if sel_type == "(all)" else all_runs[all_runs["mode"] == sel_type]
-
-    st.dataframe(runs, width="stretch", hide_index=True, height=280)
-    run_ids = runs["id"].tolist()
-    if not run_ids:
-        return
-    sel_run = st.selectbox(
-        "Inspect run", run_ids,
-        format_func=lambda i: (
-            f"#{i} — {runs.loc[runs['id'] == i, 'mode'].iloc[0]} "
-            f"{runs.loc[runs['id'] == i, 'session_date'].iloc[0]}"))
-    rt = q("SELECT strategy, symbol, side, qty, entry_ts, entry_price, "
-           "exit_ts, exit_price, gross_pnl, costs, net_pnl, r_multiple, "
-           "exit_reason FROM trades WHERE run_id=? ORDER BY exit_ts", (sel_run,))
-    if rt.empty:
-        st.caption("This run closed no trades.")
-        return
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Trades", len(rt))
-    c2.metric("Net", inr(rt["net_pnl"].sum()))
-    c3.metric("Costs", inr(rt["costs"].sum()))
-    st.dataframe(rt, width="stretch", hide_index=True, height=330)
-    per_strat = rt.groupby("strategy")["net_pnl"].agg(["count", "sum"])
-    per_strat.columns = ["trades", "net ₹"]
-    st.dataframe(per_strat.reset_index(), width="stretch", hide_index=True)
-
-
-# ---------------------------------------------------------------- Skips tab
-
-def render_skips():
-    skips = q(f"SELECT ts, mode, strategy, symbol, reason FROM skips WHERE {MW} "
-              "ORDER BY id DESC LIMIT 500", MP)
-    st.caption("Why signals did NOT become trades — the risk engine's audit trail.")
-    if skips.empty:
-        st.caption("None recorded.")
-        return
-    if not multi:
-        skips = skips.drop(columns=["mode"])
-    reason_counts = (skips["reason"].str.split(":").str[0]
-                     .value_counts().reset_index())
-    reason_counts.columns = ["reason", "count"]
-    st.dataframe(reason_counts, width="stretch", hide_index=True)
-    st.dataframe(skips, width="stretch", hide_index=True, height=380)
-
-
-# ------------------------------------------------------------ fleet analysis
+# ------------------------------------------------------------ Fleet analysis
 
 def _variant_ledger() -> pd.DataFrame:
-    """Per-variant realized stats for the selected mode, enriched with the
-    discovered-spec metadata (entry_expr, channel, source, status)."""
     led = q(
-        f"SELECT variant_key, strategy, COUNT(*) AS trades, "
-        f"SUM(net_pnl) AS net, "
+        f"SELECT variant_key, strategy, COUNT(*) AS trades, SUM(net_pnl) AS net, "
         f"SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END) AS wins, "
         f"SUM(CASE WHEN net_pnl > 0 THEN net_pnl ELSE 0 END) AS gains, "
         f"-SUM(CASE WHEN net_pnl < 0 THEN net_pnl ELSE 0 END) AS losses "
@@ -615,7 +521,6 @@ def _variant_ledger() -> pd.DataFrame:
     merged["trades"] = merged["trades"].fillna(0).astype(int)
     for c in ("net", "wins", "gains", "losses"):
         merged[c] = merged[c].fillna(0.0)
-    # a variant with no discovered-spec row is a classic strategy
     merged["channel"] = merged["channel"].fillna(merged["strategy"]).fillna("—")
     merged["entry_expr"] = merged["entry_expr"].fillna("—")
     merged["source"] = merged["source"].fillna("classic")
@@ -625,20 +530,17 @@ def _variant_ledger() -> pd.DataFrame:
     return merged
 
 
-def render_fleet():
+def render_fleet() -> None:
     st.caption("Every strategy variant — classic + discovered + bred — with its "
                "own track record. Discovered specs are DATA (a boolean entry_expr) "
                "run through a whitelist-only interpreter; all trading is paper.")
     v = _variant_ledger()
-
     active_specs = q("SELECT channel, status, source FROM discovered_specs")
     n_active_disc = int((active_specs["status"] == "ACTIVE").sum()) if not active_specs.empty else 0
     traded = v[v["trades"] > 0]
     total_trades = int(traded["trades"].sum())
-    fleet_wins = float(traded["wins"].sum())
-    fleet_wr = fleet_wins / total_trades * 100 if total_trades else 0.0
+    fleet_wr = float(traded["wins"].sum()) / total_trades * 100 if total_trades else 0.0
     realized = float(traded["net"].sum())
-    # "graduates" = discovered specs that have proven out on a real forward ledger
     disc = traded[traded["source"].isin(["discovered", "mixer"])]
     graduates = int(((disc["trades"] >= 15) & (disc["net"] > 0)).sum()) if not disc.empty else 0
 
@@ -660,113 +562,175 @@ def render_fleet():
         chan["net"] = chan["net"].round(0)
         st.dataframe(chan[["channel", "variants", "trades", "win%", "net"]],
                      width="stretch", hide_index=True)
-        st.subheader("Realized P&L by channel")
         st.bar_chart(chan.set_index("channel")["net"])
     else:
         st.caption("No closed trades yet — variants build their ledgers as they trade.")
 
     st.subheader("All variants (classic + discovered + bred)")
     show = v.copy()
-    show["net"] = show["net"].round(0)
-    show["win%"] = show["win%"].round(0)
-    show["PF"] = show["PF"].round(2)
+    show["net"] = pd.to_numeric(show["net"], errors="coerce").round(0)
+    show["win%"] = pd.to_numeric(show["win%"], errors="coerce").round(0)
+    # PF is pd.NA for variants with no losing trades — coerce so .round() is safe.
+    show["PF"] = pd.to_numeric(show["PF"], errors="coerce").round(2)
     show = show.sort_values(["channel", "net"], ascending=[True, False])
     st.dataframe(
         show[["variant_key", "channel", "source", "status", "trades", "win%",
               "net", "PF", "entry_expr"]],
         width="stretch", hide_index=True, height=420,
-        column_config={"entry_expr": st.column_config.TextColumn("entry_expr", width="large")},
-    )
-
-    disc_specs = q("SELECT name, channel, source, status, entry_expr, gate_json, "
-                   "created_at FROM discovered_specs ORDER BY created_at DESC LIMIT 25")
-    if not disc_specs.empty:
-        st.subheader("Discovered / bred spotlight")
-        def _gate(g):
-            try:
-                d = json.loads(g) if g else {}
-                return d.get("reason", "")
-            except Exception:
-                return ""
-        disc_specs["gate"] = disc_specs["gate_json"].map(_gate)
-        st.dataframe(disc_specs[["name", "channel", "source", "status", "entry_expr",
-                                 "gate", "created_at"]],
-                     width="stretch", hide_index=True)
-
-    _render_backtest_runner()
+        column_config={"entry_expr": st.column_config.TextColumn("entry_expr", width="large")})
 
 
-def _render_backtest_runner():
-    from bot.backtest import PERIODS
+# --------------------------------------------------------- Feed & Status tab
 
-    st.subheader("🧪 Run a backtest")
-    st.caption("Replays cached 1m bars through the real engine. Read-only — "
-               "results are held in this session, not written to the DB.")
-    with st.form("fleet_backtest"):
-        col = st.columns(4)
-        period = col[0].selectbox("Period", list(PERIODS), index=1)
-        max_instr = col[1].number_input("Max instruments", 1, 60, 15)
-        capital = col[2].number_input("Capital ₹", 100_000, 50_000_000,
-                                      int(config.PAPER_STARTING_CASH), step=100_000)
-        seeds_only = col[3].checkbox("Seeds only", value=False,
-                                     help="backtest only the SEED_GENES library (equity)")
-        submitted = st.form_submit_button("Run backtest")
+def render_feed_status() -> None:
+    render_engine_status()
+    st.divider()
 
-    if submitted:
-        from bot.backtest import run_and_save
-        with st.spinner(f"Replaying {period}…"):
-            try:
-                _, summary = run_and_save(period=period, max_instruments=int(max_instr),
-                                          starting_cash=float(capital), seeds_only=seeds_only)
-                st.session_state["fleet_bt"] = {"period": period, "summary": summary,
-                                                "seeds_only": seeds_only}
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Backtest failed: {exc}")
-
-    last = st.session_state.get("fleet_bt")
-    if last:
-        s = last["summary"]
-        if "error" in s:
-            st.warning(s["error"])
-        else:
-            st.caption(f"Last run · {last['period']}"
-                       + (" · seeds only" if last['seeds_only'] else ""))
-            m = st.columns(5)
-            m[0].metric("Sessions", s["sessions"])
-            m[1].metric("Trades", f"{s['trades']:,}")
-            m[2].metric("Net P&L", inr(s["total_net"]))
-            m[3].metric("Max DD", f"{s['max_dd_pct']:.1f}%")
-            pf = s["profit_factor"]
-            m[4].metric("Profit factor",
-                        "∞" if pf == float("inf") else (f"{pf:.2f}" if pf else "—"))
-
-
-# ------------------------------------------------------------ page dispatch
-
-def _auto(fn, secs):
-    """Render fn, auto-refreshing every `secs` if fragments are available."""
-    if hasattr(st, "fragment"):
-        st.fragment(run_every=secs)(fn)()
+    st.subheader("Cached bar provenance")
+    st.caption("Where the 1-minute bars in the cache came from. Live ticks and "
+               "Fyers /history backfills are tagged `fyers`; dev backfills `yf`/`dhan`.")
+    prov = q("SELECT source, COUNT(*) AS bars, MIN(ts) AS first, MAX(ts) AS last "
+             "FROM bars_1m GROUP BY source ORDER BY bars DESC")
+    if prov.empty:
+        st.caption("No cached bars yet.")
     else:
-        fn()
+        st.dataframe(prov, width="stretch", hide_index=True)
+
+    st.subheader("Recent skips — why signals did NOT become trades")
+    skips = q(f"SELECT ts, mode, strategy, symbol, reason FROM skips WHERE {MW} "
+              "ORDER BY id DESC LIMIT 500", MP)
+    if skips.empty:
+        st.caption("None recorded.")
+        return
+    if not multi:
+        skips = skips.drop(columns=["mode"])
+    reason_counts = (skips["reason"].str.split(":").str[0]
+                     .value_counts().reset_index())
+    reason_counts.columns = ["reason", "count"]
+    c1, c2 = st.columns([1, 2])
+    c1.dataframe(reason_counts, width="stretch", hide_index=True)
+    c2.dataframe(skips, width="stretch", hide_index=True, height=360)
 
 
-tab_summary, tab_picks, tab_trades, tab_ledger, tab_hist, tab_fleet, tab_runs, tab_skips = \
-    st.tabs(PAGES)
+# ===========================================================================
+# 🟢 LIVE — real-money readiness & broker gate (inactive until a graduate)
+# ===========================================================================
 
-with tab_summary:
-    _auto(render_summary, "10s")
-with tab_picks:
-    _auto(render_picks, "30s")
-with tab_trades:
-    render_trades()
-with tab_ledger:
-    render_ledger()
-with tab_hist:
-    render_history()
-with tab_fleet:
-    render_fleet()
-with tab_runs:
-    render_runs()
-with tab_skips:
-    render_skips()
+def live_readiness() -> None:
+    st.caption("Real orders route through the broker only for strategies that "
+               "**graduate** off the paper book. This is the path from paper → real.")
+    from bot import reports
+    from rich.console import Console
+    results = reports.promotion_readiness(console=Console(quiet=True), mode="PAPER")
+    ready = [r for r in results if r["verdict"] == "READY"]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Real orders", "OFF" if not config.LIVE_TRADING_ENABLED else "ON ⚠️")
+    c2.metric("Allowlisted strategies", len(config.LIVE_STRATEGY_ALLOWLIST))
+    c3.metric("Promotion-ready", len(ready),
+              help=f"meet PROMOTION_CRITERIA over the trailing "
+                   f"{config.PROMOTION_CRITERIA['window_sessions']} sessions "
+                   "(fallback-feed trades excluded)")
+
+    if not config.LIVE_TRADING_ENABLED:
+        st.info("Real trading is **disabled** (`LIVE_TRADING_ENABLED=False`). When "
+                "enabled, only allowlisted strategies may route live orders; "
+                "everything else keeps paper-trading in the same session.")
+    else:
+        st.warning("⚠️ Real order placement is ENABLED for allowlisted strategies.")
+
+    st.subheader("Promotion readiness (paper track record)")
+    st.caption("Judged on the production **Fyers** feed only — trades booked on a "
+               "yfinance fallback/degrade are excluded.")
+    if not results:
+        st.caption("No paper trades recorded yet.")
+        return
+    rows = []
+    for r in results:
+        rows.append({
+            "Strategy": r["strategy"], "Trades": r["trades"],
+            "Win %": round(r["win_rate"], 0),
+            "PF": round(r["profit_factor"], 2) if r["profit_factor"] else None,
+            "Expectancy ₹": round(r["expectancy"], 0),
+            "Net ₹": round(r["net"], 0),
+            "Verdict": "✅ READY" if r["verdict"] == "READY" else "⏳ NOT READY",
+            "Failing": ", ".join(r["failing"]) or "-",
+        })
+    df = pd.DataFrame(rows).sort_values(["Verdict", "Net ₹"], ascending=[True, False])
+    st.dataframe(df, width="stretch", hide_index=True)
+
+
+def live_broker_gate() -> None:
+    st.caption("Broker wiring and the hard gates that guard real order placement.")
+    dhan = config.dhan_settings()
+    fyers = config.fyers_settings()
+    confirm_ok = config.live_confirm() == config.LIVE_CONFIRM_STRING
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Order gate", "CLOSED (safe)" if not config.LIVE_TRADING_ENABLED else "OPEN ⚠️")
+    c2.metric("Dhan creds",
+              "configured" if dhan["client_id"] and dhan["access_token"] else "missing")
+    c3.metric("Fyers creds",
+              "configured" if fyers["app_id"] and fyers["secret_id"] else "missing")
+
+    st.subheader("Live gate checklist")
+    st.caption("ALL four must pass before a single real order can route "
+               "(run_live.py --live).")
+    checks = [
+        ("config.LIVE_TRADING_ENABLED", config.LIVE_TRADING_ENABLED),
+        ("strategy in LIVE_STRATEGY_ALLOWLIST",
+         len(config.LIVE_STRATEGY_ALLOWLIST) > 0),
+        (".env live-confirm == LIVE_CONFIRM_STRING", confirm_ok),
+        ("launched with --live flag", "runtime — set per session"),
+    ]
+    st.dataframe(pd.DataFrame(
+        [{"Gate": g, "Status": ("✅" if v is True else "❌" if v is False else f"ℹ️ {v}")}
+         for g, v in checks]),
+        width="stretch", hide_index=True)
+
+    st.markdown(
+        f"- Allowlist: `{sorted(config.LIVE_STRATEGY_ALLOWLIST) or 'empty'}` "
+        "— only these may route live.\n"
+        "- Fyers provides free data (+ optional order routing); Dhan is the "
+        "alternate order broker.\n"
+        f"- Live capital cap: {inr(config.LIVE_CAPITAL)} · "
+        f"max concurrent: {config.LIVE_MAX_CONCURRENT_POSITIONS}.")
+
+    live_trades = q("SELECT COUNT(*) AS n, COALESCE(SUM(net_pnl),0) AS net "
+                    "FROM trades WHERE mode='LIVE'")
+    n_live = int(live_trades.iloc[0]["n"]) if not live_trades.empty else 0
+    if n_live:
+        st.subheader("Live trades")
+        st.metric("Live trades booked", n_live,
+                  inr(float(live_trades.iloc[0]["net"])))
+    else:
+        st.caption("No live trades booked yet.")
+
+
+# ---------------------------------------------------------------- dispatch
+if view == "🟢 Live":
+    st.title("🟢 Live — real trading")
+    tab_ready, tab_broker = st.tabs(["Readiness", "Broker & Gate"])
+    with tab_ready:
+        live_readiness()
+    with tab_broker:
+        live_broker_gate()
+else:
+    st.title("📝 Paper")
+    (tab_sum, tab_open, tab_closed, tab_fleet, tab_hist, tab_bt, tab_feed) = st.tabs(
+        ["📊 Summary", "📖 Open Book", "📕 Closed Book", "🧬 Fleet",
+         "📅 History", "🧪 Backtest", "📡 Feed & Status"])
+    with tab_sum:
+        render_summary()
+    with tab_open:
+        render_open_book()
+    with tab_closed:
+        render_closed_book()
+    with tab_fleet:
+        render_fleet()
+    with tab_hist:
+        render_history()
+    with tab_bt:
+        render_backtest()
+    with tab_feed:
+        render_feed_status()

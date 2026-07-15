@@ -1,8 +1,10 @@
 """Historical data: 1m candle backfill into bars_1m and prev-day reference
 levels (PDH/PDL/close, volume profile for RVOL, avg range) computed from it.
 
-Sources: yfinance (free, ≤7 days per 1m request, ~30 days lookback) or the
-Dhan intraday API when a token + data subscription exist.
+Sources: Fyers /history (the authorized backtest source — free, months of 1m
+history, fails loud when unavailable), the Dhan intraday API (token + data
+subscription), or yfinance (free but ≤7 days per 1m request, ~30-day lookback;
+dev/warmup only).
 """
 from __future__ import annotations
 
@@ -118,28 +120,46 @@ def fetch_1m_dhan(symbols_with_ids: dict[str, str], start: date, end: date) -> i
     return total
 
 
+class FyersHistoryUnavailable(RuntimeError):
+    """Fyers /history could not be reached — no valid token, the client failed
+    to build, or every request errored. Raised (never silently swallowed) so the
+    backtest fails loud instead of falling back to a different data source."""
+
+
 def fetch_1m_fyers(symbols: list[str], start: date, end: date) -> int:
-    """Backfill via Fyers history API (free; needs a valid access token).
+    """Backfill via the Fyers history API (free; needs a valid access token).
 
-    Minute data is served in windows, chunked to FYERS_HISTORY_CHUNK_DAYS.
+    Minute data is served in windows, chunked to FYERS_HISTORY_CHUNK_DAYS to stay
+    within Fyers' per-request range cap. This is the AUTHORIZED backtest source:
+    if Fyers history is unavailable it raises FyersHistoryUnavailable rather than
+    silently returning 0 (which would let a caller fall back to yfinance).
     """
-    from fyers_apiv3 import fyersModel
-
     from bot import fyers_auth
     from bot.feeds.fyers_feed import fyers_symbol
 
+    # Check auth BEFORE importing the SDK so a missing token fails loud and clear
+    # even on a machine without fyers-apiv3 installed.
     token = fyers_auth.ensure_access_token()
     if token is None:
-        log.warning("fyers history: no valid token, skipping")
-        return 0
-    fy = fyersModel.FyersModel(client_id=config.fyers_settings()["app_id"],
-                               token=token, is_async=False, log_path="")
+        raise FyersHistoryUnavailable(
+            "no valid Fyers access token — run the morning login: "
+            "python -m bot.fyers_auth (Fyers /history is free but requires auth)")
+    try:
+        from fyers_apiv3 import fyersModel
+        fy = fyersModel.FyersModel(client_id=config.fyers_settings()["app_id"],
+                                   token=token, is_async=False, log_path="")
+    except Exception as exc:  # noqa: BLE001
+        raise FyersHistoryUnavailable(f"could not build Fyers client: {exc}") from exc
+
     total = 0
+    requests_made = 0
+    errors: list[str] = []
     for sym in symbols:
         chunk_start = start
         while chunk_start <= end:
             chunk_end = min(chunk_start + timedelta(days=config.FYERS_HISTORY_CHUNK_DAYS - 1),
                             end)
+            requests_made += 1
             try:
                 resp = fy.history({
                     "symbol": fyers_symbol(sym), "resolution": "1",
@@ -148,6 +168,10 @@ def fetch_1m_fyers(symbols: list[str], start: date, end: date) -> int:
                     "range_to": chunk_end.isoformat(),
                     "cont_flag": "1",
                 })
+                # Fyers signals failure in-band with s != "ok" — treat as an error
+                # so an auth/entitlement problem fails loud rather than looking empty.
+                if isinstance(resp, dict) and resp.get("s") not in (None, "ok"):
+                    raise RuntimeError(resp.get("message") or resp)
                 candles = (resp or {}).get("candles") or []
                 rows = []
                 for c in candles:  # [epoch, o, h, l, c, v]
@@ -160,7 +184,14 @@ def fetch_1m_fyers(symbols: list[str], start: date, end: date) -> int:
             except Exception as exc:  # noqa: BLE001
                 log.warning("fyers history failed %s %s..%s: %s",
                             sym, chunk_start, chunk_end, exc)
+                errors.append(f"{sym} {chunk_start}..{chunk_end}: {exc}")
             chunk_start = chunk_end + timedelta(days=1)
+
+    # Every request errored (e.g. token rejected, endpoint down) — fail loud.
+    if total == 0 and requests_made and len(errors) == requests_made:
+        raise FyersHistoryUnavailable(
+            f"all {requests_made} Fyers /history request(s) failed; "
+            f"last error: {errors[-1]}")
     return total
 
 
