@@ -121,7 +121,7 @@ def ensure_access_token() -> str | None:
     if tokens.get("access_token"):
         log.warning("fyers access token is stale (saved %s, today %s) — treating as missing",
                     saved[:10] or "never", today)
-    alerts.send("No fresh Fyers login today — run `python -m bot.fyers_auth`")
+    alerts.send_login_reminder()
     return None
 
 

@@ -119,6 +119,10 @@ def test_stale_token_treated_as_missing_and_alerts(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(config, "FYERS_TOKENS_FILE", tokens_file)
     monkeypatch.setattr(config, "CACHE_DIR", tmp_path)
+    # The nudge is now session-gated + hourly-throttled (see alerts.send_login_reminder):
+    # force an in-session, fresh-throttle state so the alert is expected to fire.
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)  # fresh throttle state file
+    monkeypatch.setattr(fyers_auth.clock, "phase", lambda now: fyers_auth.clock.OPEN)
 
     sent: list[str] = []
     monkeypatch.setattr(fyers_auth.alerts, "send", lambda msg: sent.append(msg) or True)

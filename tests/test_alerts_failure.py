@@ -49,6 +49,36 @@ def test_failed_send_does_not_write_throttle(monkeypatch, tmp_path):
     assert not (tmp_path / ".alert_k").exists()
 
 
+def test_login_reminder_sends_once_then_throttles(monkeypatch, tmp_path):
+    """In-session, the login nudge fires once then is throttled for the hour —
+    the fix for the 'same nudge 3x in a few minutes' spam (ensure_access_token
+    is called from several subsystems per cycle)."""
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    from bot import clock
+    monkeypatch.setattr(clock, "phase", lambda now: clock.OPEN)
+    sent: list[str] = []
+    monkeypatch.setattr(alerts, "send", lambda msg, **kw: sent.append(msg) or True)
+
+    assert alerts.send_login_reminder(throttle_minutes=60) == "sent"
+    assert len(sent) == 1 and "login" in sent[0].lower()
+    # every subsequent caller within the hour is suppressed
+    assert alerts.send_login_reminder(throttle_minutes=60) == "throttled"
+    assert alerts.send_login_reminder(throttle_minutes=60) == "throttled"
+    assert len(sent) == 1
+
+
+def test_login_reminder_silent_off_session(monkeypatch, tmp_path):
+    """No nudge outside a trading-day session — never pings at night/weekends."""
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    from bot import clock
+    monkeypatch.setattr(clock, "phase", lambda now: clock.CLOSED)
+    sent: list[str] = []
+    monkeypatch.setattr(alerts, "send", lambda msg, **kw: sent.append(msg) or True)
+
+    assert alerts.send_login_reminder() == "off-session"
+    assert sent == []
+
+
 def test_send_prefers_alerts_channel(monkeypatch):
     posted: dict = {}
 

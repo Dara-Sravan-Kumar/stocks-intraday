@@ -92,6 +92,37 @@ def _throttle_touch(key: str) -> None:
         pass
 
 
+_LOGIN_REMINDER_KEY = "login_reminder"
+
+
+def send_login_reminder(throttle_minutes: int = 60) -> str:
+    """Market-hours-gated, hourly nudge to run a fresh Fyers login.
+
+    ensure_access_token() calls this from several subsystems every cycle (feed,
+    broker, history, options); an unthrottled raw send() therefore fired one
+    Discord ping PER caller for a single stale token — the "3 in a few minutes"
+    spam. This gate fixes it: the nudge only posts on a trading-day session
+    (PREOPEN/OPEN/SQUAREOFF — never nights, weekends, or holidays) and at most
+    once per `throttle_minutes` via a state file in this bot's own data dir.
+
+    DELIBERATELY NOT SHARED: stockbot + mcxbot share one Fyers token and
+    coordinate a single throttle at <FYERS_TOKEN_PATH dir>/.fyers_login_reminder_sent.
+    intraday has its OWN token (data/cache/fyers_tokens.json) and its OWN login
+    (`python -m bot.fyers_auth`), so its nudge MUST stay separate — merging it
+    into their shared file would let their reminder suppress intraday's distinct
+    "run bot.fyers_auth" nudge and you'd never learn intraday needs its own login.
+    Returns a short status ("off-session" | "throttled" | "sent" | "failed")."""
+    from bot import clock
+    if clock.phase(clock.now_ist()) == clock.CLOSED:
+        return "off-session"
+    if _throttle_active(_LOGIN_REMINDER_KEY, throttle_minutes):
+        return "throttled"
+    ok = send("No fresh Fyers login today — run `python -m bot.fyers_auth`")
+    if ok:
+        _throttle_touch(_LOGIN_REMINDER_KEY)
+    return "sent" if ok else "failed"
+
+
 def send_failure_alert(failures: list[dict], *, throttle_key: str | None = None,
                        throttle_minutes: int = 0) -> str:
     """Post a redacted, categorized failure alert to the alerts channel.

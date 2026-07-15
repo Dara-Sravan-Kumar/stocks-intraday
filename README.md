@@ -40,6 +40,23 @@ Dhan access tokens expire every **24 h** (regenerate on web.dhan.co). If the
 websocket dies mid-session the bot degrades to yfinance automatically and keeps
 trading — it never crashes the session.
 
+### Fyers login reminder — SEPARATE from the other bots
+
+This bot has its **own** Fyers token (`data/cache/fyers_tokens.json`) and its own
+login: `python -m bot.fyers_auth` (run each trading morning). When
+`ensure_access_token()` finds no fresh token it posts a Discord nudge via
+`alerts.send_login_reminder()`, which is **session-gated** (only on a trading-day
+session, never nights/weekends/holidays) and **throttled to one post per hour**.
+
+⚠️ This throttle is **intentionally NOT shared** with stockbot/mcxbot. Those two
+share one token and coordinate a single throttle file; this bot's login is
+distinct, so its nudge must stay on its own throttle
+(`data/.alert_login_reminder`). Do **not** point it at their shared file — that
+would let their reminder suppress this bot's "run `bot.fyers_auth`" nudge and you'd
+never learn intraday needs its own login. (Previously this nudge was unthrottled
+and fired once per calling subsystem — feed/broker/history/options — so a single
+stale token produced several identical pings within a minute.)
+
 ## Strategies (params in `config.STRATEGY_PARAMS`)
 
 | Name | Idea | Stop / Target |
