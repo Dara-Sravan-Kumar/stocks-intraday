@@ -225,8 +225,57 @@ def render_engine_status() -> None:
     st.markdown(f"**Running strategies:** {chips or '—'}")
 
 
+def _fyers_connection() -> tuple[bool, str]:
+    """Read-only Fyers status for the Summary banner. Green when today's login
+    exists (token saved_at == today, mirroring fyers_auth.ensure_access_token)
+    AND — if a session is actually live (fresh heartbeat) — its feed is the real
+    fyers-ws/replay feed. Red when a running session is on a degraded/fallback
+    feed (book FROZEN) or when there is no fresh token. A STALE heartbeat (dead
+    session) is ignored so an old yfinance beat doesn't read as a live freeze.
+    Pure display; reads the token file + heartbeat only, changes no logic."""
+    from datetime import datetime
+
+    try:
+        tok = json.loads(config.FYERS_TOKENS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        tok = {}
+    today = date.today().isoformat()
+    logged_in = bool(tok.get("access_token")) and str(tok.get("saved_at", ""))[:10] == today
+
+    feed = ""
+    hb = heartbeat()
+    if hb:
+        try:
+            beat = datetime.fromisoformat(str(hb.get("wall_ts", "")))
+            if (datetime.now(beat.tzinfo) - beat).total_seconds() < 180:
+                feed = str(hb.get("feed", "")).lower()   # only trust a FRESH beat
+        except Exception:
+            feed = ""
+    live_real = feed.startswith(("fyers-ws", "replay"))
+    live_degraded = bool(feed) and not live_real
+
+    if live_degraded:
+        return False, f"live feed is {hb.get('feed')} (fallback) — book FROZEN"
+    if logged_in:
+        if live_real:
+            return True, f"live feed {hb.get('feed')}"
+        return True, f"today's token present (saved {str(tok.get('saved_at', ''))[:16]})"
+    return False, "no fresh token today"
+
+
+def _fyers_banner() -> None:
+    ok, detail = _fyers_connection()
+    if ok:
+        st.success(f"🟢 **Connected to Fyers** — {detail}.")
+    else:
+        st.error(f"🔴 **Not connected to Fyers** — {detail}. Run the daily Fyers "
+                 "login (before the market session) so the engine trades on the "
+                 "real feed; the paper book is frozen otherwise.")
+
+
 def render_summary() -> None:
     today = date.today().isoformat()
+    _fyers_banner()
     render_engine_status()
     st.divider()
 
